@@ -27,6 +27,11 @@ version-file = "src/ov_postgres/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ov_postgres"]
 
+# Without this the sdist sweeps in everything not gitignored -- editor config,
+# the lockfile, unrelated project files. Name what belongs in a source release.
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/pyproject.toml"]
+
 [dependency-groups]
 dev = [
     "mypy>=1.11",
