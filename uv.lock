@@ -2657,7 +2657,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ov-pgvector"
+name = "ov-postgres"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

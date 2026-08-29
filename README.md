@@ -25,11 +25,12 @@ You need a PostgreSQL 13+ database with [pgvector](https://github.com/pgvector/p
 uv pip install -e . --no-deps
 ```
 
-Add one block to `~/.openviking/ov.conf`, beside whatever `storage` settings you already have:
+Here is a complete `~/.openviking/ov.conf` that runs on Postgres. Copy it whole, change the DSN, and you are done:
 
 ```json
 {
   "storage": {
+    "workspace": "~/.openviking/data",
     "vectordb": {
       "backend": "ov_postgres.adapter.PgVectorCollectionAdapter",
       "name": "context",
@@ -37,9 +38,19 @@ Add one block to `~/.openviking/ov.conf`, beside whatever `storage` settings you
         "dsn": "postgresql://openviking:secret@localhost:5432/openviking"
       }
     }
-  }
+  },
+  "embedding": {
+    "dense": {
+      "provider": "local",
+      "model": "bge-small-zh-v1.5-f16",
+      "dimension": 512
+    }
+  },
+  "server": { "host": "127.0.0.1", "port": 1933 }
 }
 ```
+
+Only the `storage.vectordb` block belongs to this package. The rest is ordinary OpenViking configuration, shown so the file is complete rather than a fragment — if you already have an `ov.conf`, add just that block and leave everything else alone.
 
 Start OpenViking. On first run it creates the extension, three tables, and the indexes. Confirm it took:
 
@@ -103,7 +114,7 @@ docker run -d --name ov-postgres \
 The DSN resolves from `custom_params.dsn`, then the top-level `url`, then the environment. Omit it from the file and export it instead:
 
 ```bash
-export OPENVIKING_PGVECTOR_DSN="postgresql://openviking:secret@localhost:5432/openviking"
+export OPENVIKING_POSTGRES_DSN="postgresql://openviking:secret@localhost:5432/openviking"
 ```
 
 `OPENVIKING_PG_DSN` and `DATABASE_URL` also work.
@@ -113,9 +124,17 @@ export OPENVIKING_PGVECTOR_DSN="postgresql://openviking:secret@localhost:5432/op
 Give OpenViking its own schema rather than sharing `public`:
 
 ```json
-"custom_params": {
-  "schema": "openviking",
-  "table_prefix": "ov_"
+{
+  "storage": {
+    "vectordb": {
+      "backend": "ov_postgres.adapter.PgVectorCollectionAdapter",
+      "custom_params": {
+        "dsn": "postgresql://openviking:secret@localhost:5432/openviking",
+        "schema": "openviking",
+        "table_prefix": "ov_"
+      }
+    }
+  }
 }
 ```
 
@@ -124,11 +143,18 @@ Give OpenViking its own schema rather than sharing `public`:
 The default is exact search: correct always, linear in collection size. Fine into the tens of thousands of rows. Beyond that, switch to an approximate index:
 
 ```json
-"custom_params": {
-  "dsn": "postgresql://...",
-  "index_method": "hnsw",
-  "index_options": { "m": 16, "ef_construction": 64 },
-  "iterative_scan": "relaxed_order"
+{
+  "storage": {
+    "vectordb": {
+      "backend": "ov_postgres.adapter.PgVectorCollectionAdapter",
+      "custom_params": {
+        "dsn": "postgresql://openviking:secret@localhost:5432/openviking",
+        "index_method": "hnsw",
+        "index_options": { "m": 16, "ef_construction": 64 },
+        "iterative_scan": "relaxed_order"
+      }
+    }
+  }
 }
 ```
 
@@ -139,9 +165,16 @@ The default is exact search: correct always, linear in collection size. Fine int
 Where your role cannot create extensions, have an administrator install pgvector once and then:
 
 ```json
-"custom_params": {
-  "dsn": "postgresql://...",
-  "create_extension": false
+{
+  "storage": {
+    "vectordb": {
+      "backend": "ov_postgres.adapter.PgVectorCollectionAdapter",
+      "custom_params": {
+        "dsn": "postgresql://openviking:secret@db.example.com:5432/openviking",
+        "create_extension": false
+      }
+    }
+  }
 }
 ```
 
@@ -162,6 +195,67 @@ WHERE uri LIKE '/user/default/notes%'
 ORDER BY updated_at DESC
 LIMIT 10;
 ```
+
+### A fully specified configuration
+
+Every option this package accepts, set explicitly, in a complete file. Values shown are a reasonable production shape rather than the defaults — see the table below for what each one does and what it defaults to.
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "backend": "s3",
+      "s3": {
+        "bucket": "openviking",
+        "endpoint": "https://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "openviking-rw",
+        "secret_key": "REPLACE_ME",
+        "use_ssl": true,
+        "use_path_style": true
+      }
+    },
+    "vectordb": {
+      "backend": "ov_postgres.adapter.PgVectorCollectionAdapter",
+      "name": "context",
+      "index_name": "default",
+      "distance_metric": "cosine",
+      "sparse_weight": 0.0,
+      "custom_params": {
+        "dsn": "postgresql://openviking:secret@db.example.com:5432/openviking",
+        "schema": "openviking",
+        "table_prefix": "ov_",
+        "index_method": "hnsw",
+        "index_options": { "m": 16, "ef_construction": 64 },
+        "iterative_scan": "relaxed_order",
+        "create_extension": true,
+        "distance": "cosine",
+        "keyword_fields": ["name", "description", "abstract", "tags", "search_tags"],
+        "text_search_config": "english",
+        "tz_policy": "local",
+        "min_pool_size": 2,
+        "max_pool_size": 16,
+        "connect_timeout": 10.0,
+        "application_name": "openviking"
+      }
+    }
+  },
+  "embedding": {
+    "dense": {
+      "provider": "local",
+      "model": "bge-small-zh-v1.5-f16",
+      "dimension": 512
+    }
+  },
+  "server": { "host": "127.0.0.1", "port": 1933 }
+}
+```
+
+Three of those deserve a note:
+
+- **`text_search_config`** defaults to `simple`, which does no stemming and keeps stopwords, so a search for `database` will not match the word `databases`. Set it to `english` for English content. It is language-specific, which is why the neutral option is the default.
+- **`distance`** duplicates the outer `distance_metric`. Set either; `custom_params.distance` wins if both are present.
+- **`storage.agfs`** is OpenViking's document store and is entirely separate from the vector store. Changing the vector backend does not move your documents.
 
 ### All configuration options
 
@@ -237,7 +331,7 @@ The integration suite starts a `pgvector/pgvector` container through testcontain
 uv run pytest -m integration
 ```
 
-Point it at a server you already have with `OV_PGVECTOR_TEST_DSN` instead. Each test runs in a throwaway schema that is dropped afterwards.
+Point it at a server you already have with `OV_POSTGRES_TEST_DSN` instead. Each test runs in a throwaway schema that is dropped afterwards.
 
 The suite's centrepiece is `test_filter_semantics_match_reference`: it generates random records and **1,089 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. That is what pins this backend to native behaviour rather than to an interpretation of it.
 

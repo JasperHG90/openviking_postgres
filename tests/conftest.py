@@ -4,10 +4,10 @@ Integration tests run against a real PostgreSQL with pgvector, started as a
 throwaway container via testcontainers.  One container is shared by the whole
 session; each test gets its own PostgreSQL schema inside it.
 
-Set ``OV_PGVECTOR_TEST_DSN`` to point at an existing server instead, which
+Set ``OV_POSTGRES_TEST_DSN`` to point at an existing server instead, which
 skips the container entirely::
 
-    export OV_PGVECTOR_TEST_DSN=postgresql://localhost/openviking_test
+    export OV_POSTGRES_TEST_DSN=postgresql://localhost/openviking_test
 
 If neither a container runtime nor a DSN is available, the integration tests
 skip rather than fail, so the unit suite stays runnable anywhere.
@@ -22,10 +22,10 @@ from dataclasses import dataclass
 
 import pytest
 
-TEST_DSN_ENV = "OV_PGVECTOR_TEST_DSN"
+TEST_DSN_ENV = "OV_POSTGRES_TEST_DSN"
 
 # Official pgvector image: PostgreSQL with the extension already built in.
-PGVECTOR_IMAGE = os.environ.get("OV_PGVECTOR_TEST_IMAGE", "pgvector/pgvector:pg17")
+POSTGRES_IMAGE = os.environ.get("OV_POSTGRES_TEST_IMAGE", "pgvector/pgvector:pg17")
 
 
 @pytest.fixture(scope="session")
@@ -47,12 +47,12 @@ def dsn() -> Iterator[str]:
             from testcontainers.postgres import PostgresContainer
     except ImportError:  # pragma: no cover - depends on the environment
         pytest.skip(
-            "Neither $OV_PGVECTOR_TEST_DSN nor testcontainers is available; "
+            "Neither $OV_POSTGRES_TEST_DSN nor testcontainers is available; "
             "run `uv sync` to install the dev dependency group"
         )
 
     try:
-        container = PostgresContainer(PGVECTOR_IMAGE, driver=None)
+        container = PostgresContainer(POSTGRES_IMAGE, driver=None)
         container.start()
     except Exception as exc:  # pragma: no cover - depends on the environment
         pytest.skip(
@@ -77,7 +77,7 @@ def _verify_pgvector(dsn: str) -> bool:
                 pytest.fail(
                     "The 'vector' extension is not available on this server. "
                     "Use the pgvector/pgvector image, or install pgvector on the "
-                    "server $OV_PGVECTOR_TEST_DSN points at."
+                    "server $OV_POSTGRES_TEST_DSN points at."
                 )
     return True
 

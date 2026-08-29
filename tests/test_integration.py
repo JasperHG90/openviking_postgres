@@ -2,7 +2,7 @@
 
 Run with::
 
-    OV_PGVECTOR_TEST_DSN=postgresql://localhost/openviking_test \
+    OV_POSTGRES_TEST_DSN=postgresql://localhost/openviking_test \
         .venv/bin/python -m pytest tests/test_integration.py -v
 
 The most valuable test here is ``test_filter_semantics_match_reference``: it

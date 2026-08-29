@@ -19,7 +19,7 @@ IterativeScan = Literal["off", "strict_order", "relaxed_order"]
 TimezonePolicy = Literal["local", "utc"]
 
 DSN_ENV_VARS: tuple[str, ...] = (
-    "OPENVIKING_PGVECTOR_DSN",
+    "OPENVIKING_POSTGRES_DSN",
     "OPENVIKING_PG_DSN",
     "DATABASE_URL",
 )

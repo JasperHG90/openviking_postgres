@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
 
 [project]
 name = "ov-postgres"
-version = "0.1.0"
+dynamic = ["version"]
 description = "PostgreSQL + pgvector backend for OpenViking's vector store"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,8 +13,19 @@ dependencies = [
     "pydantic>=2",
 ]
 
-[tool.setuptools]
-packages = ["ov_postgres"]
+# Version comes from git tags, so a build always matches a commit and there is
+# no number to forget to bump.
+[tool.hatch.version]
+source = "vcs"
+raw-options.git_describe_command = [
+    "git", "describe", "--dirty", "--tags", "--long", "--match", "v*",
+]
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ov_postgres/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ov_postgres"]
 
 [dependency-groups]
 dev = [
@@ -70,7 +81,7 @@ python_version = "3.12"
 plugins = ["pydantic.mypy"]
 strict = true
 warn_unreachable = true
-files = ["ov_postgres", "tests"]
+files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 # OpenViking ships no type information, so its symbols arrive as Any.

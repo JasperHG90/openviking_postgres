@@ -324,7 +324,7 @@ def test_dsn_falls_back_to_environment(
     monkeypatch: pytest.MonkeyPatch, dsn: str, test_schema: str
 ) -> None:
     """A DSN can come from the environment."""
-    monkeypatch.setenv("OPENVIKING_PGVECTOR_DSN", dsn)
+    monkeypatch.setenv("OPENVIKING_POSTGRES_DSN", dsn)
     config = VectorDBBackendConfig(
         backend="ov_postgres.adapter.PgVectorCollectionAdapter",
         name="context",
@@ -339,7 +339,7 @@ def test_dsn_falls_back_to_environment(
 
 def test_missing_dsn_raises_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing DSN names every place one could be set."""
-    for var in ("OPENVIKING_PGVECTOR_DSN", "OPENVIKING_PG_DSN", "DATABASE_URL"):
+    for var in ("OPENVIKING_POSTGRES_DSN", "OPENVIKING_PG_DSN", "DATABASE_URL"):
         monkeypatch.delenv(var, raising=False)
     config = VectorDBBackendConfig(
         backend="ov_postgres.adapter.PgVectorCollectionAdapter", name="context"

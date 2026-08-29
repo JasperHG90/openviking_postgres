@@ -22,4 +22,12 @@ __all__ = [
     "UnsupportedFilterError",
 ]
 
-__version__ = "0.1.0"
+try:  # populated by hatch-vcs at build time
+    from ._version import __version__
+except ImportError:  # editable install or source checkout
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        __version__ = version("ov-postgres")
+    except PackageNotFoundError:
+        __version__ = "0.0.0+unknown"
