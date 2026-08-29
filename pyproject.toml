@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ov-postgres"
+version = "0.1.0"
+description = "PostgreSQL + pgvector backend for OpenViking's vector store"
+requires-python = ">=3.10"
+dependencies = [
+    "openviking>=0.4.16",
+    "psycopg[binary,pool]>=3.1",
+    "pydantic>=2",
+]
+
+[tool.setuptools]
+packages = ["ov_postgres"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=7",
+    "ruff>=0.6",
+    "testcontainers[postgres]>=4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests start a PostgreSQL container, so they stay out of the
+# default run. Ask for them explicitly with `uv run pytest -m integration`.
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs a live PostgreSQL with pgvector (starts a container)",
+]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade -- enforces modern union/generic syntax
+    "B",    # bugbear
+    "D",    # pydocstyle -- enforces the docstring rule
+    "ANN",  # flake8-annotations -- enforces the type-hint rule
+    "RUF",
+]
+ignore = [
+    "D107",    # __init__ docstring; numpy documents params on the class
+    "D203",    # incompatible with D211
+    "D213",    # incompatible with D212
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+# Test functions are self-describing; a summary line is still required by D103.
+"tests/*" = ["ANN401"]
+
+[tool.mypy]
+# Checked against the interpreter this project actually runs on. The 3.10
+# floor in `requires-python` is enforced by ruff's `target-version = "py310"`,
+# which rejects newer syntax; mypy cannot target 3.10 here because numpy's
+# bundled stubs use 3.12-only `type` statements and fail to parse.
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+strict = true
+warn_unreachable = true
+files = ["ov_postgres", "tests"]
+
+[[tool.mypy.overrides]]
+# OpenViking ships no type information, so its symbols arrive as Any.
+# numpy is a transitive dependency this package never calls; its bundled stubs
+# use 3.12-only `type` statements, which would fail a 3.10-targeted check.
+module = ["openviking.*", "openviking_cli.*", "testcontainers.*", "numpy.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

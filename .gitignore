@@ -1,0 +1,11 @@
+.DS_Store
+
+.openviking
+
+.claude
+.mypy_cache
+minio-openviking-rw.json
+.ruff_cache
+.pytest_cache
+
+*.egg-info
