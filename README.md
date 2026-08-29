@@ -21,8 +21,10 @@ OpenViking ships five vector backends — `local`, `cuvs`, `http`, `volcengine`,
 
 You need a PostgreSQL 13+ database with [pgvector](https://github.com/pgvector/pgvector) available, and OpenViking 0.4.16 or newer.
 
+Install into the environment that runs OpenViking:
+
 ```bash
-uv pip install -e . --no-deps
+uv add "ov-postgres @ git+https://github.com/JasperHG90/ov-postgres@v0.1.0"
 ```
 
 Here is a complete `~/.openviking/ov.conf` that runs on Postgres. Copy it whole, change the DSN, and you are done:
@@ -88,13 +90,42 @@ An empty result means the pgvector binary is not installed on the **server**. No
 
 ### Install the package
 
+Install it into the **same environment that runs OpenViking**. The server imports the adapter by class path, so it has to be on that interpreter's path.
+
+From a tagged release:
+
 ```bash
-uv pip install -e . --no-deps
+uv add "ov-postgres @ git+https://github.com/JasperHG90/ov-postgres@v0.1.0"
 ```
 
-`--no-deps` matters when installing into an existing OpenViking environment: it stops the resolver from touching packages OpenViking already pinned. For a fresh environment, use `uv sync` instead.
+Or from a wheel attached to a GitHub Release:
 
-The package must be importable by the process that runs OpenViking, not just from this directory.
+```bash
+uv add https://github.com/JasperHG90/ov-postgres/releases/download/v0.1.0/ov_postgres-0.1.0-py3-none-any.whl
+```
+
+If OpenViking runs from a virtualenv you manage by hand rather than a `uv` project:
+
+```bash
+uv pip install --python /path/to/openviking/.venv/bin/python \
+  "ov-postgres @ git+https://github.com/JasperHG90/ov-postgres@v0.1.0"
+```
+
+Confirm it landed where OpenViking will find it:
+
+```bash
+/path/to/openviking/.venv/bin/python -c "import ov_postgres; print(ov_postgres.__version__)"
+```
+
+### Working on the package itself
+
+```bash
+git clone https://github.com/JasperHG90/ov-postgres
+cd ov-postgres
+uv sync
+```
+
+The version comes from git tags via `hatch-vcs`, so a clone without tags builds as `0.0.0+unknown`. Use `git clone` rather than a source archive, and keep `fetch-depth: 0` in any CI that builds.
 
 ### Docker for local development
 

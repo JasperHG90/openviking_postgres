@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  UV_VERSION: '0.11.x'
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pre-commit checks
+        uses: JasperHG90/toiminnot/actions/prek@main
+        with:
+          python_version: ${{ env.PYTHON_VERSION }}
+          prek_version: '0.2.25'
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Run unit tests
+        uses: JasperHG90/toiminnot/actions/pytest@main
+        with:
+          directory: tests
+          uv_version: ${{ env.UV_VERSION }}
+          python_version: ${{ matrix.python-version }}
+          markers: "not integration"
+      # The integration suite starts a pgvector/pgvector container through
+      # testcontainers. ubuntu-latest ships a running Docker daemon, so no
+      # service container is needed; the suite skips itself if one is absent.
+      - name: Run integration tests
+        uses: JasperHG90/toiminnot/actions/pytest@main
+        with:
+          directory: tests
+          uv_version: ${{ env.UV_VERSION }}
+          python_version: ${{ matrix.python-version }}
+          markers: "integration"
+
+  build:
+    needs: [pre-commit, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # hatch-vcs derives the version from git describe, so a shallow
+          # clone would build as 0.0.0 or fail outright.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check the wheel installs and imports on its own
+        run: |
+          uv venv /tmp/wheelcheck
+          uv pip install --python /tmp/wheelcheck/bin/python --no-deps dist/*.whl
+          uv pip install --python /tmp/wheelcheck/bin/python "psycopg[binary,pool]>=3.1" "pydantic>=2"
+          /tmp/wheelcheck/bin/python -c "import ov_postgres; print(ov_postgres.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+          retention-days: 7

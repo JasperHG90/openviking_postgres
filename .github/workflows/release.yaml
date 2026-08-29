@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.12'
+  UV_VERSION: '0.11.x'
+
+jobs:
+  build-python:
+    name: Build Python package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # hatch-vcs reads the tag through git describe, so the full history
+          # and tags must be present or the release builds the wrong version.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify the built version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          built=$(ls dist/*.whl | sed -E 's/.*ov_postgres-([^-]+)-py3.*/\1/')
+          echo "tag=$tag built=$built"
+          test "$tag" = "$built"
+
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: [build-python]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: '*-dist'
+
+      - name: Detect pre-release
+        id: prerelease
+        run: |
+          tag='${{ github.ref_name }}'
+          if [[ "$tag" =~ (rc|alpha|beta|dev) ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ steps.prerelease.outputs.is_prerelease == 'false' }}
+          files: |
+            artifacts/python-dist/*
+
+      - name: Update latest tag
+        if: steps.prerelease.outputs.is_prerelease == 'false'
+        run: |
+          git tag -f latest
+          git push origin latest --force
