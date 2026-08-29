@@ -14,7 +14,7 @@ OpenViking ships five vector backends — `local`, `cuvs`, `http`, `volcengine`,
 - **Every field becomes a real typed column**, so filters compile to ordinary SQL over ordinary indexes — and you can inspect your agent's memory with `psql`.
 - **Exact search by default.** Switch to HNSW or IVFFlat when volume demands it, with version-gated iterative scan so a selective filter never silently returns a short page.
 - **Lexical keyword search** over your text columns, via PostgreSQL full-text search — no embedding model needed.
-- **Filter behaviour is pinned to OpenViking's own evaluator** by 1,089 differential cases, not to one developer's reading of the spec.
+- **Filter behaviour is checked against OpenViking's own evaluator** by 1,089 differential cases in the integration suite, so a filter behaves the same here as on the built-in backend.
 - **Runs on managed PostgreSQL** where your role cannot `CREATE EXTENSION`.
 
 ## Quick start
@@ -57,6 +57,7 @@ Only the `storage.vectordb` block belongs to this package. The rest is ordinary 
 Start OpenViking. On first run it creates the extension, three tables, and the indexes. Confirm it took:
 
 ```bash
+export DSN="postgresql://openviking:secret@localhost:5432/openviking"
 psql "$DSN" -c "\dt public.ov_*"
 ```
 
@@ -83,6 +84,7 @@ Your vectors are now in Postgres.
 Check pgvector is present before you start:
 
 ```bash
+export DSN="postgresql://openviking:secret@localhost:5432/openviking"
 psql "$DSN" -c "SELECT 1 FROM pg_available_extensions WHERE name='vector'"
 ```
 
@@ -348,6 +350,33 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
 
+## Troubleshooting
+
+**`Vector backend ov_postgres.adapter.PgVectorCollectionAdapter is not supported`**
+
+This message is misleading. OpenViking's adapter factory catches `ImportError`,
+`AttributeError` and `TypeError` while importing the class path and re-raises them
+all as "not supported", so the real cause is hidden. It almost always means the
+package is not importable by the process running OpenViking. Check directly:
+
+```bash
+/path/to/openviking/.venv/bin/python -c "import ov_postgres"
+```
+
+That reports the actual error — a missing dependency, or the package installed
+into a different interpreter than the one running the server.
+
+**`The 'vector' extension is not installed in this database`**
+
+Raised when `create_extension` is false and pgvector is genuinely absent. Ask an
+administrator to run `CREATE EXTENSION vector`, or set `create_extension` back to
+true if the role has the privilege.
+
+**Searches return nothing after switching backends**
+
+Expected: a new database starts empty. Vectors do not migrate from the previous
+backend, so the collection has to be re-indexed.
+
 ## Testing
 
 The default run is fast and offline:
@@ -364,7 +393,7 @@ uv run pytest -m integration
 
 Point it at a server you already have with `OV_POSTGRES_TEST_DSN` instead. Each test runs in a throwaway schema that is dropped afterwards.
 
-The suite's centrepiece is `test_filter_semantics_match_reference`: it generates random records and **1,089 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. That is what pins this backend to native behaviour rather than to an interpretation of it.
+The suite's centrepiece is `test_filter_semantics_match_reference` — part of the **integration** suite, so `uv run pytest` alone does not exercise it. It generates random records and **1,089 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. That is what pins this backend to native behaviour rather than to an interpretation of it.
 
 ## Contributing
 

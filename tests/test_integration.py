@@ -710,3 +710,52 @@ def test_range_out_on_unknown_field_matches_everything(
     adapter.upsert([{"id": f"r{i}", "vector": vec(i)} for i in range(3)])
     node = {"op": "range_out", "field": "nope", "gte": 1}
     assert len(adapter.query(filter=node, limit=10)) == 3
+
+
+def test_read_modify_write_preserves_vectors(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """A fetched record fed back into upsert must keep its embedding.
+
+    ``upsert_data`` replaces the whole row, and OpenViking's
+    ``increment_active_count`` and ``update_uri_mapping`` both do
+    ``upsert(record | {...})`` on a record from ``get()``. If ``get()`` omitted
+    the vector, the upsert would write NULL over it and the row would vanish
+    from every vector search while still existing in the table.
+    """
+    adapter.upsert(
+        {
+            "id": "a",
+            "name": "doc",
+            "active_count": 0,
+            "sparse_vector": {"7": 1.0},
+            "vector": vec(1),
+        }
+    )
+    assert [r["id"] for r in adapter.query(query_vector=vec(1), limit=5)] == ["a"]
+
+    record = adapter.get(["a"])[0]
+    assert "vector" in record, "get() must return vectors for read-modify-write"
+    assert "sparse_vector" in record
+
+    adapter.upsert(record | {"active_count": 1})
+
+    assert [r["id"] for r in adapter.query(query_vector=vec(1), limit=5)] == ["a"]
+    after = adapter.get(["a"])[0]
+    assert after["active_count"] == 1
+    assert after["vector"] == record["vector"]
+    assert after["sparse_vector"] == {"7": 1.0}
+
+
+def test_search_projection_still_excludes_vectors(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """Search results stay lean; only ``get()`` returns the full row.
+
+    Guards the fix above from being widened into ``_output_columns``, which
+    would put a 512-float vector in every search result.
+    """
+    adapter.upsert({"id": "a", "name": "doc", "vector": vec(1)})
+    hit = adapter.query(query_vector=vec(1), limit=1)[0]
+    assert "vector" not in hit
+    assert "sparse_vector" not in hit

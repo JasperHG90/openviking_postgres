@@ -735,7 +735,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if not primary_keys:
             return FetchDataInCollectionResult(items=[], ids_not_exist=[])
         pk = self._schema.primary_key.name
-        columns = self._output_columns(None)
+        # Every column, vectors included -- not the search projection.
+        # `upsert_data` replaces the whole row, and OpenViking's read-modify-write
+        # paths (`increment_active_count`, `update_uri_mapping`) feed a fetched
+        # record straight back into it. A projection that omitted vectors would
+        # write NULL over them and silently drop the row out of every search.
+        columns = [spec.name for spec in self._schema.fields]
         rows = self._execute(
             sql.SQL("SELECT {} FROM {} WHERE {} = ANY(%s)").format(
                 self._select_list(columns), self._qualified, sql.Identifier(pk)
