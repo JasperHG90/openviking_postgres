@@ -527,6 +527,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         statements: list[ddl.IndexStatement] = list(
             ddl.scalar_index_statements(self._db_schema, self._table, self._schema, taken)
         )
+        unstamped: list[ddl.IndexStatement] = []
 
         vector_field = self._schema.vector_field
         if vector_field is not None:
@@ -540,7 +541,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 taken,
             )
             if vector_stmt is not None:
-                statements.append(vector_stmt)
+                # Deliberately unstamped, and kept out of `statements`. Its
+                # shape depends on the distance metric and method recorded at
+                # creation, which reconciliation must not change, so it is
+                # never in the reconcilable set -- and a fingerprint would
+                # therefore mark it as an index this version no longer wants,
+                # for the orphan sweep to drop.
+                unstamped.append(vector_stmt)
 
         if fts_stmt is not None:
             statements.append(fts_stmt)
@@ -557,6 +564,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     cur.execute(entry.statement)
                     if entry.name not in present:
                         _stamp(cur, self._db_schema, entry)
+                for entry in unstamped:
+                    cur.execute(entry.statement)
                 # Record the method actually built, not the one requested:
                 # OpenViking always asks for `flat`/`flat_hybrid`, so a
                 # collection configured for hnsw would otherwise be recorded as
@@ -853,11 +862,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # enough -- it made previously-safe mixed workloads deadlock.
                 # Sorted for lock ordering only; `updated` is re-ordered to
                 # match the caller's input below, as upsert_data does.
-                for record in sorted(
-                    data_list, key=lambda r: _sort_key(self._coerce_key(r.get(pk)))
-                ):
+                # Checked before sorting: the sort key coerces the primary
+                # key, which raises on a missing one and would make this
+                # message unreachable.
+                for record in data_list:
                     if pk not in record:
                         raise ValueError(f"update_data record is missing {pk!r}")
+                for record in sorted(
+                    data_list, key=lambda r: _sort_key(self._coerce_key(r[pk]))
+                ):
                     key = self._coerce_key(record[pk])
                     if (
                         vector_field is not None
@@ -926,12 +939,22 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if not primary_keys:
             return True
         keys = self._lookup_keys(primary_keys)
-        pk = self._schema.primary_key.name
+        pk = sql.Identifier(self._schema.primary_key.name)
+        # Rows are claimed in the same order the writers claim them. A bare
+        # DELETE locks in scan order, which for a batch overlapping a
+        # concurrent upsert is a different order, and the two deadlock. The
+        # sub-select takes the locks explicitly, ordered to match `_sort_key`:
+        # code-point order for text, numeric for an integer key.
+        ordered_pk: sql.Composable = pk
+        if self._schema.primary_key.ov_type in ("string", "text", "path"):
+            ordered_pk = sql.SQL('{} COLLATE "C"').format(pk)
         self._execute(
-            sql.SQL("DELETE FROM {} WHERE {} = ANY(%s)").format(
-                self._qualified, sql.Identifier(pk)
-            ),
-            (keys,),
+            sql.SQL(
+                "DELETE FROM {table} WHERE {pk} IN ("
+                "SELECT {pk} FROM {table} WHERE {pk} = ANY(%s) "
+                "ORDER BY {ordered} FOR UPDATE)"
+            ).format(table=self._qualified, pk=pk, ordered=ordered_pk),
+            (sorted(keys, key=_sort_key),),
         )
         return True
 
@@ -1795,6 +1818,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             if self._index_generation == generation:
                 self._resolved_method = resolved
                 return resolved
+        # The indexes changed under this read, so its answer describes a state
+        # that no longer holds. Ask again rather than cache it.
         return self._resolved_index_method()
 
     def ensure_indexes(self) -> list[str]:
@@ -1880,15 +1905,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         changed: list[str] = []
         skipped: list[str] = []
         seen: set[str] = set()
+        wanted_names = {entry.name for entry in wanted}
         for name, fingerprint in sorted(existing.items()):
             if (
                 fingerprint is not None
                 and str(fingerprint).startswith(_FINGERPRINT_PREFIX)
-                and name not in {entry.name for entry in wanted}
+                and name not in wanted_names
                 and name not in constrained
             ):
                 self._execute(
-                    sql.SQL("DROP INDEX {}.{}").format(
+                    sql.SQL("DROP INDEX IF EXISTS {}.{}").format(
                         sql.Identifier(self._db_schema), sql.Identifier(name)
                     )
                 )
@@ -1920,7 +1946,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                             skipped.append(name)
                             continue
                     cur.execute(
-                        sql.SQL("DROP INDEX {}.{}").format(
+                        sql.SQL("DROP INDEX IF EXISTS {}.{}").format(
                             sql.Identifier(self._db_schema), sql.Identifier(name)
                         )
                     )

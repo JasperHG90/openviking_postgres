@@ -8,6 +8,7 @@ dense+sparse scoring.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 import threading
@@ -2847,5 +2848,183 @@ def test_upsert_and_update_report_keys_the_same_way(dsn: str, test_schema: str) 
         ]
         assert collection.update_data([{"id": 10, "level": 2}]).ids == [10]
         assert [r["id"] for r in adapter.get([10])] == [10]
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("method", ["hnsw", "ivfflat"])
+def test_ensure_indexes_keeps_the_ann_index(
+    dsn: str, test_schema: str, method: str
+) -> None:
+    """Reconciliation must not touch the vector index.
+
+    Its shape depends on the distance metric and method recorded at creation,
+    so it is deliberately outside the reconcilable set -- which makes a
+    fingerprint on it read as an index this version no longer wants. The sweep
+    that retires those would drop it, and since `create_collection` returns
+    early for an existing collection it is never rebuilt. Searches keep
+    working, sequentially, so nothing reports the loss.
+    """
+    adapter = build(dsn, test_schema, index_method=method)
+    try:
+        adapter.upsert(
+            [
+                {"id": f"r{n:03d}", "level": n, "vector": vec(n % 20 + 1)}
+                for n in range(60)
+            ]
+        )
+        name = f"ov_context__vector_{method}_idx"
+        assert name in indexes_on(dsn, test_schema)
+        assert adapter.ensure_indexes() == []
+        assert name in indexes_on(dsn, test_schema)
+        assert adapter.ensure_indexes() == []
+        assert name in indexes_on(dsn, test_schema)
+    finally:
+        adapter.close()
+
+
+def test_ensure_indexes_survives_a_concurrent_drop(dsn: str, test_schema: str) -> None:
+    """Two processes reconciling at once must not abort each other.
+
+    A rolling upgrade runs this from every instance, and the loser of the race
+    finds the index already gone. A bare ``DROP INDEX`` raises there, leaving
+    the run half-applied -- the state the constraint handling exists to avoid.
+
+    Asserted on the statement rather than raced for: the window is a few
+    microseconds wide and reproduces perhaps one run in three, which is no use
+    as a regression test.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "name": "text", "vector": vec(1)})
+    finally:
+        adapter.close()
+
+    adapter = build_existing(dsn, test_schema, text_search_config="english")
+    try:
+        collection = cast(Any, adapter.get_collection())._Collection__collection
+        seen: list[str] = []
+        original = collection._pool.connection
+
+        class RecordingCursor:
+            """Cursor wrapper that keeps the SQL text of every statement."""
+
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+                seen.append(
+                    statement.as_string(None)
+                    if hasattr(statement, "as_string")
+                    else str(statement)
+                )
+                return self._inner.execute(statement, *args, **kwargs)
+
+            def __getattr__(self, item: str) -> Any:
+                return getattr(self._inner, item)
+
+        @contextlib.contextmanager
+        def recording_connection(*args: Any, **kwargs: Any) -> Any:
+            with original(*args, **kwargs) as conn:
+                real_cursor = conn.cursor
+
+                @contextlib.contextmanager
+                def cursor(*a: Any, **k: Any) -> Any:
+                    with real_cursor(*a, **k) as cur:
+                        yield RecordingCursor(cur)
+
+                conn.cursor = cursor
+                yield conn
+
+        collection._pool.connection = recording_connection
+        try:
+            assert collection.ensure_indexes() == ["ov_context__fts_idx"]
+        finally:
+            collection._pool.connection = original
+
+        drops = [text for text in seen if text.startswith("DROP INDEX")]
+        assert drops, seen
+        assert all("IF EXISTS" in text for text in drops), drops
+    finally:
+        adapter.close()
+
+
+def test_delete_claims_rows_in_the_order_writers_claim_them(
+    dsn: str, test_schema: str
+) -> None:
+    """A delete must lock rows in the same order upserts do.
+
+    A bare ``DELETE ... WHERE pk = ANY(...)`` locks in scan order, while
+    writes lock in ``_sort_key`` order, so an overlapping batch deadlocks.
+    The ordering is asserted on the plan rather than raced for: a deadlock
+    reproduces about one run in five, which is no use as a regression test.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        keys = [f"k{n}" for n in range(8)]
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in keys])
+        collection = cast(Any, adapter.get_collection())._Collection__collection
+        seen: list[str] = []
+        original = collection._execute
+
+        def record(statement: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.append(statement.as_string(None))
+            return original(statement, *args, **kwargs)
+
+        collection._execute = record
+        try:
+            collection.delete_data(list(reversed(keys)))
+        finally:
+            collection._execute = original
+
+        deletes = [text for text in seen if text.startswith("DELETE")]
+        assert len(deletes) == 1
+        assert "FOR UPDATE" in deletes[0]
+        assert 'ORDER BY "id" COLLATE "C"' in deletes[0]
+        assert adapter.count() == 0
+    finally:
+        adapter.close()
+
+
+def test_deletes_and_upserts_do_not_deadlock(dsn: str, test_schema: str) -> None:
+    """The ordering above, exercised under real contention."""
+    keys = [f"k{n}" for n in range(8)]
+    adapter = build(dsn, test_schema)
+    try:
+        errors: list[BaseException] = []
+
+        def write(seed: int) -> None:
+            batch = [{"id": k, "level": seed, "vector": vec(1)} for k in keys]
+            try:
+                for _ in range(150):
+                    adapter.upsert(batch)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def wipe() -> None:
+            try:
+                for _ in range(150):
+                    adapter.delete(ids=list(keys))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+        threads += [threading.Thread(target=wipe) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == [], errors[0]
+    finally:
+        adapter.close()
+
+
+def test_update_data_reports_a_missing_primary_key(dsn: str, test_schema: str) -> None:
+    """The record-level check must run before the key is coerced for sorting."""
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "level": 0, "vector": vec(1)})
+        with pytest.raises(ValueError, match="update_data record is missing 'id'"):
+            adapter.get_collection().update_data([{"level": 9}])
     finally:
         adapter.close()

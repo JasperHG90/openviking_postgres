@@ -274,3 +274,18 @@ def test_no_value_is_interpolated_into_sql(compiler: FilterCompiler) -> None:
     )
     assert "DROP TABLE" not in text
     assert params == [["'; DROP TABLE ov_context; --"]]
+
+
+def test_balanced_or_refuses_an_empty_fragment_list() -> None:
+    """There is no identity for ``||``, so an empty list must raise, not recurse."""
+    from psycopg import sql
+
+    from ov_postgres.collection import _balanced_or
+
+    with pytest.raises(ValueError, match="at least one fragment"):
+        _balanced_or([])
+    assert _balanced_or([sql.SQL("a")]).as_string(None) == "(a)"
+    assert (
+        _balanced_or([sql.SQL("a"), sql.SQL("b"), sql.SQL("c")]).as_string(None)
+        == "((a) || ((b) || (c)))"
+    )
