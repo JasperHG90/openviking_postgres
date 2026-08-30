@@ -49,6 +49,11 @@ ARRAY_TYPES: frozenset[str] = frozenset({"list<string>", "list<int64>"})
 # Field types whose values are textual and can be searched as text.
 TEXT_TYPES: frozenset[str] = frozenset({"string", "text", "path"})
 
+# PostgreSQL's bigint and real bounds; a declared default outside them would
+# fail every write rather than being merely unusual.
+_BIGINT_MIN, _BIGINT_MAX = -(2**63), 2**63 - 1
+_REAL_MAX = 3.4028235e38
+
 GEO_LON_SUFFIX = "_lon"
 GEO_LAT_SUFFIX = "_lat"
 
@@ -427,9 +432,26 @@ def _fits(spec: FieldSpec, value: object) -> bool:
     if spec.ov_type == "bool":
         return isinstance(value, bool)
     if spec.ov_type == "int64":
-        return isinstance(value, int) and not isinstance(value, bool)
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and _BIGINT_MIN <= value <= _BIGINT_MAX
+        )
     if spec.ov_type == "float32":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if spec.ov_type in ("list<string>", "list<int64>"):
-        return isinstance(value, list)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and abs(value) <= _REAL_MAX
+        )
+    if spec.ov_type == "list<string>":
+        return isinstance(value, list) and all(isinstance(v, str) for v in value)
+    if spec.ov_type == "list<int64>":
+        # Element types and range matter as much as the container's: a list of
+        # strings, or an out-of-range integer, would fail every write.
+        return isinstance(value, list) and all(
+            isinstance(v, int)
+            and not isinstance(v, bool)
+            and _BIGINT_MIN <= v <= _BIGINT_MAX
+            for v in value
+        )
     return False

@@ -750,6 +750,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             Number of rows updated.
         """
         self._check_open()
+        batch = int(batch_size)
+        if batch < 1:
+            raise ValueError(f"batch_size must be at least 1, got {batch_size!r}")
         assignments: list[Statement] = []
         params: list[Any] = []
         predicates: list[Statement] = []
@@ -780,7 +783,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             sets=sql.SQL(", ").join(assignments),
             pk=pk,
             needs=needs_repair,
-            limit=sql.Literal(int(batch_size)),
+            limit=sql.Literal(batch),
         )
 
         total = 0
@@ -789,7 +792,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 cur.execute(statement, params)
                 repaired = int(cur.rowcount)
             total += repaired
-            if repaired < batch_size:
+            if repaired < batch:
                 return total
 
     def delete_all_data(self) -> bool:
@@ -907,7 +910,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         order_expr, order_params = self._order_expression(dense_vector, sparse_vector)
 
         statement = sql.SQL(
-            "SELECT {cols}, {score} AS _score, {vec_present} AS _has_vector "
+            "SELECT {cols}, {score} AS _score, {vec_present} AS __ov_has_vector "
             "FROM {table} WHERE {pred} ORDER BY {order} LIMIT %s OFFSET %s"
         ).format(
             cols=self._select_list(columns, include_extra=include_extra),
@@ -926,11 +929,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             fetch="all",
             setup=self._iterative_scan_setup(filtered=bool(filters)),
         )
-        hybrid = bool(
-            sparse_vector and self._schema.sparse_field and self._sparse_weight > 0
-        )
+        # Floored whenever a dense vector was asked for, hybrid included. The
+        # dense half of a hybrid score is fabricated for a row with no
+        # embedding -- `coalesce(..., 0.0)` is the best possible value for l2
+        # and ip, where every real term is negative -- so such a row could
+        # outrank genuine matches on a score it did not earn.
         return self._rows_to_search_result(
-            rows, columns, floor_vectorless=dense_vector is not None and not hybrid
+            rows, columns, floor_vectorless=dense_vector is not None
         )
 
     def search_by_id(
@@ -1365,7 +1370,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return sql.SQL("0.0::double precision"), []
         return sql.SQL("({})").format(sql.SQL(" + ").join(terms)), params
 
-    def _iterative_scan_setup(self, *, filtered: bool) -> list[Statement]:
+    def _iterative_scan_setup(self, *, filtered: bool = True) -> list[Statement]:
         """Build the ``SET LOCAL`` prelude for a filtered ANN search.
 
         An ANN index visits a fixed candidate pool and only then applies the
@@ -1380,18 +1385,23 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         supports only ``relaxed_order``, so ``strict_order`` degrades to it
         rather than erroring.
 
+        Applies to every ANN search, not only a filtered one: an index scan
+        visits at most ``hnsw.ef_search`` candidates (40 by default), so a bare
+        ``LIMIT 200`` silently returned 40 rows once the index was actually
+        being used.
+
         Parameters
         ----------
         filtered :
-            Whether the query carries a filter. Unfiltered ANN search returns
-            a full page already, so the GUC would only add cost.
+            Accepted for call-site clarity; the GUC is needed either way.
 
         Returns
         -------
         list[Statement]
             Zero or one ``SET LOCAL`` statement.
         """
-        if not filtered or self._iterative_scan == "off":
+        del filtered  # every ANN search needs this, not only a filtered one
+        if self._iterative_scan == "off":
             return []
         if self._index_method not in ("hnsw", "ivfflat"):
             return []
@@ -1540,7 +1550,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # applies an absolute threshold -- 0.0 would let it overtake a
                 # genuine match. In a hybrid search its sparse score is real,
                 # so it is reported as computed.
-                if floor_vectorless and row.get("_has_vector") is False:
+                if floor_vectorless and row.get("__ov_has_vector") is False:
                     score = NO_VECTOR_SCORE
             items.append(SearchItemResult(id=identifier, fields=record, score=score))
         return SearchResult(data=items)
@@ -1600,6 +1610,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             If a record omits the primary key.
         """
         pk = self._schema.primary_key.name
+        vector_field = self._schema.vector_field
         columns: list[str] = []
         for spec in self._schema.fields:
             if spec.is_geo:
@@ -1630,6 +1641,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             mapping["extra"] = json.dumps(extra) if extra else "{}"
             if mapping.get(pk) is None:
                 raise ValueError(f"upsert record is missing primary key {pk!r}")
+            if vector_field is not None and mapping.get(vector_field.name) is None:
+                # The engine's validator marks the vector Required, so no such
+                # row can exist there. Allowing one here would also make it
+                # invisible: pgvector's HNSW and IVFFlat builds skip NULL
+                # vectors, so an index scan can never return it.
+                raise ValueError(
+                    f"record {mapping[pk]!r} has no {vector_field.name!r}: "
+                    "an embedding is required, as the built-in backend requires it"
+                )
             ids.append(str(mapping[pk]))
             rows.append([mapping.get(name) for name in columns])
         return columns, rows, ids
@@ -1679,6 +1699,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 return None
             return parse_datetime_to_epoch_ms(value, self._tz_policy)
         if spec.is_array:
+            parts: list[Any]
             if isinstance(value, str):
                 # `;`-joined strings are accepted for list fields, matching
                 # DataProcessor._split_str_list.
@@ -1691,7 +1712,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     "or a ';'-joined string"
                 )
             if spec.ov_type == "list<int64>":
-                return [int(p) for p in parts]
+                converted: list[int] = []
+                for part in parts:
+                    if isinstance(part, float) and not part.is_integer():
+                        # Matches the scalar path and the engine's validator,
+                        # which raises int_from_float rather than truncating.
+                        raise ValueError(
+                            f"list<int64> field {spec.name!r} cannot store "
+                            f"{part!r}: a fractional value is not an integer"
+                        )
+                    converted.append(int(part))
+                return converted
             return [str(p) for p in parts]
         return value
 

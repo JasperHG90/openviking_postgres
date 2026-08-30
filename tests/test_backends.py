@@ -9,7 +9,7 @@ dense+sparse scoring.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
@@ -683,8 +683,9 @@ def test_detected_version_gates_iterative_scan(dsn: str, test_schema: str) -> No
         assert len(filtered) == 1
         assert "hnsw.iterative_scan" in filtered[0].as_string(None)
 
-        # No filter means the index already returns a full page.
-        assert inner._iterative_scan_setup(filtered=False) == []
+        # Needed for an unfiltered search too: an index scan visits at most
+        # hnsw.ef_search candidates, so a bare LIMIT 200 returned 40 rows.
+        assert len(inner._iterative_scan_setup(filtered=False)) == 1
 
         # An older pgvector must not be sent a GUC it does not know.
         inner._pgvector_version = (0, 7, 0)
@@ -1095,5 +1096,175 @@ def test_fractional_value_is_refused_by_an_int_column(dsn: str, test_schema: str
     try:
         with pytest.raises(ValueError, match="not an integer"):
             adapter.upsert({"id": "a", "level": 1.7, "vector": vec(1)})
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("limit", [40, 100, 200])
+def test_ann_search_returns_the_full_page(dsn: str, test_schema: str, limit: int) -> None:
+    """An ANN search must return as many rows as asked for.
+
+    An index scan visits at most ``hnsw.ef_search`` candidates (40 by default),
+    so once the index was genuinely being used a bare ``LIMIT 200`` silently
+    returned 40 rows. Iterative scan is needed for every ANN search, not only
+    a filtered one.
+    """
+    import random
+
+    adapter = build(dsn, test_schema, index_method="hnsw")
+    try:
+        rng = random.Random(11)
+        adapter.upsert(
+            [
+                {"id": f"r{i}", "vector": [rng.uniform(-1, 1) for _ in range(DIM)]}
+                for i in range(1500)
+            ]
+        )
+        assert len(adapter.query(query_vector=vec(1), limit=limit)) == limit
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "key,bound,expect",
+    [
+        ("gte", 2, set()),
+        ("gte", 1.5, set()),
+        ("lte", -1, set()),
+        ("lt", -1, set()),
+        ("lte", 0.5, {"f"}),
+        ("lt", 2, {"f", "t"}),
+    ],
+)
+def test_bool_range_bounds_order_numerically(
+    dsn: str, test_schema: str, key: str, bound: object, expect: set[str]
+) -> None:
+    """A bound outside 0..1 orders numerically, as Python does.
+
+    Converting the bound with ``bool()`` moved the comparison into the boolean
+    domain, so ``flag >= 2`` became ``flag >= TRUE`` and matched the true row.
+    """
+    adapter = build_geo(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "t", "flag": True, "vector": vec(1)},
+                {"id": "f", "flag": False, "vector": vec(2)},
+            ]
+        )
+        node = {"op": "range", "field": "flag", key: bound}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "key,bound,expect",
+    [
+        ("lte", 10**19, {"a"}),
+        ("lt", 10**19, {"a"}),
+        ("gte", 10**19, set()),
+        ("gte", -(10**19), {"a"}),
+        ("lte", -(10**19), set()),
+    ],
+)
+def test_out_of_range_bounds_saturate(
+    dsn: str, test_schema: str, key: str, bound: int, expect: set[str]
+) -> None:
+    """A bound beyond the column's range is satisfied or not, never an error.
+
+    Dropping it as "incomparable" answered backwards: every stored value is
+    below ``10**19``, so an upper bound is met by every row.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "level": 1, "vector": vec(1)})
+        node = {"op": "range", "field": "level", key: bound}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("conds", [[1e300], [10**400]])
+def test_huge_float_operands_match_nothing(
+    dsn: str, test_schema: str, conds: list[Any]
+) -> None:
+    """A float beyond a real's range must not reach the cast and overflow."""
+    adapter = build_geo(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "score": 1.0, "vector": vec(1)})
+        node = {"op": "must", "field": "score", "conds": conds}
+        assert adapter.query(filter=node, limit=10) == []
+    finally:
+        adapter.close()
+
+
+def test_fractional_list_element_is_refused(dsn: str, test_schema: str) -> None:
+    """A fractional element of a list<int64> must not be truncated."""
+    adapter = build_geo(dsn, test_schema)
+    try:
+        with pytest.raises(ValueError, match="not an integer"):
+            adapter.upsert({"id": "a", "counts": [1.7, 2.9], "vector": vec(1)})
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_backfill_rejects_a_useless_batch_size(
+    dsn: str, test_schema: str, bad: int
+) -> None:
+    """``batch_size=0`` looped forever issuing ``UPDATE ... LIMIT 0``."""
+    adapter = build(dsn, test_schema)
+    try:
+        with pytest.raises(ValueError, match="at least 1"):
+            adapter.backfill_defaults(batch_size=bad)
+    finally:
+        adapter.close()
+
+
+def test_backfill_rejects_a_fractional_batch_size(dsn: str, test_schema: str) -> None:
+    """A fractional batch size truncated to a different value than it compared.
+
+    The LIMIT used ``int(batch_size)`` while the termination test compared
+    against the unconverted value, so 10.5 repaired 10 rows, returned 10 and
+    stopped with rows still unrepaired.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        with pytest.raises(ValueError, match="at least 1"):
+            # Deliberately the wrong type: this guards runtime callers, which
+            # the type checker does not police.
+            adapter.backfill_defaults(batch_size=cast(int, 0.5))
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 100])
+def test_backfill_repairs_every_row_whatever_the_batch_size(
+    dsn: str, test_schema: str, batch_size: int
+) -> None:
+    """The batching loop must repair every row and then stop.
+
+    A batch smaller than the backlog forces several iterations, so this also
+    covers the loop's termination: it stops when a pass repairs fewer rows
+    than the batch size.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        collection = adapter.get_collection()
+        inner = collection._Collection__collection
+        for i in range(7):
+            inner._execute(
+                sql.SQL("INSERT INTO {}.{} (id, vector) VALUES (%s, %s::vector)").format(
+                    sql.Identifier(inner._db_schema), sql.Identifier(inner._table)
+                ),
+                (f"old{i}", "[" + ",".join(["0.1"] * DIM) + "]"),
+            )
+
+        assert adapter.backfill_defaults(batch_size=batch_size) == 7
+        assert adapter.backfill_defaults(batch_size=batch_size) == 0
+
+        node = {"op": "must", "field": "level", "conds": [0]}
+        assert len(adapter.query(filter=node, limit=50)) == 7
     finally:
         adapter.close()

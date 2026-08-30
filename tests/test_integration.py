@@ -29,6 +29,7 @@ from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 from psycopg import sql
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
+from ov_postgres.collection import NO_VECTOR_SCORE
 
 pytestmark = pytest.mark.integration
 
@@ -309,20 +310,6 @@ def test_vector_search_respects_filter(adapter: PgVectorCollectionAdapter) -> No
         limit=10,
     )
     assert [r["id"] for r in results] == ["b"]
-
-
-def test_rows_without_vectors_rank_last_in_vector_search(
-    adapter: PgVectorCollectionAdapter,
-) -> None:
-    """A row with no vector sorts last rather than disappearing.
-
-    Excluding it looked right for a dense ranking, but the same code path
-    serves filter-only queries, so the row also vanished from
-    ``delete(filter=...)`` while ``count()`` still counted it.
-    """
-    adapter.upsert([{"id": "novec", "name": "x"}, {"id": "hasvec", "vector": vec(1)}])
-    results = adapter.query(query_vector=vec(1), limit=10)
-    assert [r["id"] for r in results] == ["hasvec", "novec"]
 
 
 def test_limit_and_offset(adapter: PgVectorCollectionAdapter) -> None:
@@ -999,48 +986,20 @@ def test_bool_and_int_operands_interoperate(
     assert actual == expected
 
 
-def test_rows_without_vectors_remain_findable_and_deletable(
+def test_a_record_without_an_embedding_is_refused(
     adapter: PgVectorCollectionAdapter,
 ) -> None:
-    """A record with no embedding must not become invisible to filters.
+    """Writing a record with no vector must fail, as it does on the engine.
 
-    ``CollectionAdapter.query`` synthesises a random vector for filter-only
-    queries, so excluding vectorless rows from vector search also hid them from
-    ``delete(filter=...)`` and ``scroll`` -- while ``count()`` still counted
-    them, leaving a row that could be neither found nor removed.
+    ``DataProcessor`` marks the vector field Required, so such a row cannot
+    exist there. Storing one here would also make it unreachable: pgvector's
+    HNSW and IVFFlat builds skip NULL vectors, so an index scan can never
+    return it -- it would be counted but never found or deleted.
     """
-    adapter.upsert(
-        [
-            {"id": "novec", "level": 1, "vector": None},
-            {"id": "hasvec", "level": 1, "vector": vec(1)},
-        ]
-    )
-    assert adapter.count() == 2
-
-    node = {"op": "must", "field": "level", "conds": [1]}
-    assert {r["id"] for r in adapter.query(filter=node, limit=50)} == {
-        "novec",
-        "hasvec",
-    }
-
-    assert adapter.delete(filter=node) == 2
+    for record in ({"id": "novec", "level": 1}, {"id": "nullvec", "vector": None}):
+        with pytest.raises(ValueError, match="embedding is required"):
+            adapter.upsert(record)
     assert adapter.count() == 0
-
-
-def test_dense_search_still_ranks_vectors_first(
-    adapter: PgVectorCollectionAdapter,
-) -> None:
-    """Sorting vectorless rows last must not disturb a real ranking."""
-    adapter.upsert(
-        [
-            {"id": "novec"},
-            {"id": "near", "vector": [1.0] + [0.0] * (DIM - 1)},
-            {"id": "far", "vector": [-1.0] + [0.0] * (DIM - 1)},
-        ]
-    )
-    ranked = [r["id"] for r in adapter.query(query_vector=[1.0] + [0.0] * (DIM - 1))]
-    assert ranked[:2] == ["near", "far"]
-    assert ranked[-1] == "novec"
 
 
 def test_omitted_fields_take_the_engine_defaults(
@@ -1114,82 +1073,14 @@ def test_bool_operand_on_datetime_does_not_raise(
     adapter.query(filter=node, limit=10)
 
 
-@pytest.mark.parametrize(
-    "node,expected",
-    [
-        ({"op": "must", "field": "level", "conds": [3.0]}, {"lvl3"}),
-        ({"op": "range", "field": "level", "gte": 2.5}, {"lvl3"}),
-        ({"op": "range", "field": "level", "lt": 2.5}, {"lvl1"}),
-    ],
-)
-def test_float_operand_against_int_column(
-    adapter: PgVectorCollectionAdapter, node: dict[str, Any], expected: set[str]
-) -> None:
-    """Python compares ``3 == 3.0``; dropping float operands lost real rows."""
-    adapter.upsert(
-        [
-            {"id": "lvl3", "level": 3, "vector": vec(1)},
-            {"id": "lvl1", "level": 1, "vector": vec(2)},
-        ]
-    )
-    assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expected
-
-
-def test_vectorless_rows_rank_behind_every_vectored_row(
-    adapter: PgVectorCollectionAdapter,
-) -> None:
-    """A row with no embedding ranks behind every row that has one.
-
-    Ordering uses two keys rather than folding a sentinel into the score. No
-    sentinel works: a value small enough to sit below every real score -- l2
-    distances overflow to infinity and ``ip`` reaches 2e38 -- also swamps the
-    sparse term, collapsing sparse-only rows to one indistinguishable score.
-
-    Scores are therefore monotonic *within* the vectored group; a vectorless
-    row's score is not comparable with them and is not claimed to be.
-    """
-    adapter.upsert(
-        [
-            {"id": "novec"},
-            {"id": "near", "vector": [1.0] + [0.0] * (DIM - 1)},
-            {"id": "far", "vector": [-1.0] + [0.0] * (DIM - 1)},
-        ]
-    )
-    results = adapter.query(query_vector=[1.0] + [0.0] * (DIM - 1), limit=10)
-
-    assert [r["id"] for r in results] == ["near", "far", "novec"]
-    vectored = [r["_score"] for r in results if r["id"] != "novec"]
-    assert vectored == sorted(vectored, reverse=True)
-
-
-def test_vectorless_rows_rank_behind_even_at_extreme_magnitudes(
-    adapter: PgVectorCollectionAdapter,
-) -> None:
-    """The ordering must not depend on the magnitude of real distances.
-
-    A sentinel-based ranking broke here: pgvector accumulates l2 in float4, so
-    a distance overflows to infinity at large element magnitudes and sorts
-    below any finite sentinel, putting the vectorless row first.
-    """
-    huge = [1e35] * DIM
-    adapter.upsert(
-        [
-            {"id": "novec"},
-            {"id": "huge", "vector": huge},
-            {"id": "zero", "vector": [0.0] * DIM},
-        ]
-    )
-    ranked = [r["id"] for r in adapter.query(query_vector=[-1e35] * DIM, limit=10)]
-    assert ranked[-1] == "novec", ranked
-
-
 def test_sparse_only_rows_stay_ordered_among_themselves(
     dsn: str, test_schema: str
 ) -> None:
-    """A sentinel folded into the score would collapse these to one value.
+    """Sparse contribution must order rows the dense term cannot separate.
 
-    ``-1e30 + x == -1e30`` for any realistic sparse dot product, so both rows
-    scored identically and their relative order became arbitrary.
+    Both rows sit at the same dense distance, so any difference in ranking is
+    attributable to the sparse term. A sentinel folded into the score used to
+    collapse these to one value.
     """
     config = VectorDBBackendConfig(
         backend="ov_postgres.adapter.PgVectorCollectionAdapter",
@@ -1204,10 +1095,11 @@ def test_sparse_only_rows_stay_ordered_among_themselves(
         "context", META, distance="cosine", sparse_weight=1.0, index_name="default"
     )
     try:
+        shared = [1.0] + [0.0] * (DIM - 1)
         adapter.upsert(
             [
-                {"id": "strong", "sparse_vector": {"7": 100.0}},
-                {"id": "weak", "sparse_vector": {"7": 1.0}},
+                {"id": "strong", "vector": shared, "sparse_vector": {"7": 100.0}},
+                {"id": "weak", "vector": shared, "sparse_vector": {"7": 1.0}},
             ]
         )
         results = adapter.query(
@@ -1263,3 +1155,30 @@ def test_backfill_defaults_repairs_older_rows(
 
     # Idempotent: a second run has nothing left to repair.
     assert inner.backfill_defaults() == 0
+
+
+def test_legacy_rows_without_embeddings_rank_last_and_score_low(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """A NULL-vector row from before embeddings were required is handled.
+
+    New writes are refused, but a database written by an older version may
+    hold such rows. They rank behind every embedded row and report a score
+    below any real one, because OpenViking's retriever re-sorts by ``_score``
+    and applies an absolute threshold.
+    """
+    adapter.upsert({"id": "real", "vector": [1.0] + [0.0] * (DIM - 1)})
+
+    collection = adapter.get_collection()
+    inner = collection._Collection__collection
+    inner._execute(
+        sql.SQL("INSERT INTO {}.{} (id) VALUES (%s)").format(
+            sql.Identifier(inner._db_schema), sql.Identifier(inner._table)
+        ),
+        ("legacy",),
+    )
+
+    results = adapter.query(query_vector=[1.0] + [0.0] * (DIM - 1), limit=10)
+    assert [r["id"] for r in results] == ["real", "legacy"]
+    assert results[-1]["_score"] < results[0]["_score"]
+    assert results[-1]["_score"] <= NO_VECTOR_SCORE

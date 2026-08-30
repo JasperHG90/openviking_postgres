@@ -526,12 +526,23 @@ class FilterCompiler:
             if value is None:
                 continue
             if not _is_comparable(spec, value, for_ordering=True):
+                saturated = _saturating_bound(spec, key, value)
+                if saturated is True:
+                    # Bound beyond the column's range in the permissive
+                    # direction: every row satisfies it, so drop the term.
+                    continue
+                if saturated is False:
+                    return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
                 # `_in_range` catches TypeError and returns False, so a bound
                 # of the wrong type excludes every row rather than raising.
                 return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
-            bound_params.append(self._coerce(spec, value))
+            bound_params.append(self._coerce(spec, value, for_ordering=True))
+            # A boolean column is ordered numerically, as Python orders
+            # True/False against a number, so it is cast rather than the bound
+            # being squeezed into a boolean.
+            ordered = sql.SQL("{}::int").format(col) if spec.ov_type == "bool" else col
             parts.append(
-                sql.SQL("{} {} {}").format(col, operator, self._scalar_operand(spec))
+                sql.SQL("{} {} {}").format(ordered, operator, self._scalar_operand(spec))
             )
         params.extend(bound_params)
 
@@ -547,13 +558,35 @@ class FilterCompiler:
             return sql.SQL("(NOT COALESCE({}, FALSE))").format(inner)
         return inner
 
-    def _coerce(self, spec: FieldSpec, value: object) -> object:
+    def _coerce(
+        self, spec: FieldSpec, value: object, *, for_ordering: bool = False
+    ) -> object:
         """Apply the same type conversion the native engine applies on write.
 
         Also converts a boolean/integer operand to the column's own type, so
         the ``True == 1`` equivalence Python gives the reference survives into
         SQL, where the two types have no implicit comparison.
+
+        Parameters
+        ----------
+        spec :
+            The column the operand is compared against.
+        value :
+            The operand.
+        for_ordering :
+            True for a range bound. A boolean column is ordered numerically, so
+            the bound must keep its numeric value.
+
+        Returns
+        -------
+        object
+            The operand in the form the column expects.
         """
+        if for_ordering and spec.ov_type == "bool":
+            # The column is cast to int for ordering, so the bound keeps its
+            # numeric value rather than collapsing to a boolean -- `flag >= 2`
+            # must be false, not `flag >= TRUE`.
+            return value
         if spec.is_datetime and value is not None:
             return parse_datetime_to_epoch_ms(value, self._tz_policy)
         return _coerce_operand(spec, value)
@@ -609,14 +642,26 @@ def _is_comparable(spec: FieldSpec, value: object, *, for_ordering: bool = False
     allowed = _COMPARABLE_TYPES.get(spec.ov_type)
     if allowed is None:
         return False
-    if isinstance(value, int) and not isinstance(value, bool):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Out of the column's range: no stored value can equal it, and binding
+        # it raises NumericValueOutOfRange rather than matching nothing. Floats
+        # count too -- 1e300 overflows a real just as 10**400 does.
         if spec.ov_type in ("int64", "list<int64>") and not (
             _BIGINT_MIN <= value <= _BIGINT_MAX
         ):
-            # Out of bigint range: no stored value can equal it, and binding it
-            # raises NumericValueOutOfRange rather than matching nothing.
             return False
-        if spec.ov_type == "float32" and abs(value) > _REAL_MAX:
+        if (
+            spec.ov_type == "float32"
+            and isinstance(value, float)
+            and math.isfinite(value)
+            and abs(value) > _REAL_MAX
+        ):
+            return False
+        if (
+            spec.ov_type == "float32"
+            and isinstance(value, int)
+            and (abs(value) > _REAL_MAX)
+        ):
             return False
     if isinstance(value, float) and math.isnan(value):
         # PostgreSQL sorts NaN above every number, so `lte=NaN` selected the
@@ -657,7 +702,9 @@ def _coerce_operand(spec: FieldSpec, value: object) -> object:
         The operand as the column's type.
     """
     if spec.ov_type == "bool" and not isinstance(value, bool):
-        return bool(value)
+        # Only exact 0/1 reach here for equality; a range bound keeps its
+        # numeric value and is compared against the column cast to an integer.
+        return bool(value) if value in (0, 1) else value
     if spec.ov_type in ("int64", "list<int64>") and isinstance(value, float):
         # Only an integral float can equal an integer; `_homogenise` drops the
         # rest, and converting here keeps the list a single type.
@@ -665,6 +712,48 @@ def _coerce_operand(spec: FieldSpec, value: object) -> object:
     if isinstance(value, bool) and spec.ov_type in ("int64", "float32", "list<int64>"):
         return int(value)
     return value
+
+
+def _saturating_bound(spec: FieldSpec, key: str, value: object) -> bool | None:
+    """Resolve an out-of-range numeric bound to a constant outcome.
+
+    A bound larger than anything the column can hold is not "no match": every
+    stored value is below it, so an upper bound is satisfied by every row and a
+    lower bound by none. The reference compares in Python, where the bound is
+    representable, and answers accordingly.
+
+    Parameters
+    ----------
+    spec :
+        The column being bounded.
+    key :
+        One of ``gt``, ``gte``, ``lt``, ``lte``.
+    value :
+        The bound.
+
+    Returns
+    -------
+    bool | None
+        ``True`` when every row satisfies the bound, ``False`` when none does,
+        and ``None`` when the bound is not an out-of-range number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    low: float
+    high: float
+    if spec.ov_type in ("int64", "list<int64>"):
+        low, high = float(_BIGINT_MIN), float(_BIGINT_MAX)
+    elif spec.ov_type == "float32":
+        low, high = -_REAL_MAX, _REAL_MAX
+    else:
+        return None
+    if value > high:
+        return key in ("lt", "lte")
+    if value < low:
+        return key in ("gt", "gte")
+    return None
 
 
 def _homogenise(spec: FieldSpec, values: list[Any]) -> list[Any]:
