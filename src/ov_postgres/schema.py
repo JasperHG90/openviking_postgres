@@ -343,3 +343,47 @@ def fulltext_candidates(schema: CollectionSchema, configured: Iterable[str]) -> 
         if spec is not None and spec.is_textual:
             chosen.append(name)
     return chosen
+
+
+# Values the native engine substitutes for an omitted field. Mirrors
+# ``TYPE_DEFAULTS`` in openviking/storage/vectordb/utils/data_processor.py,
+# which builds them into the pydantic validator every write passes through.
+# Storing NULL instead would make an omitted `level` absent here and ``0``
+# there, so a filter for ``level == 0`` would find the row on the built-in
+# backend and miss it on this one.
+TYPE_DEFAULTS: dict[str, Any] = {
+    "int64": 0,
+    "float32": 0.0,
+    "string": "",
+    "bool": False,
+    "list<string>": [],
+    "list<int64>": [],
+    "text": "",
+    "path": "",
+    "date_time": "",
+    "geo_point": "",
+    "sparse_vector": {},
+}
+
+
+def default_for(spec: FieldSpec) -> object:
+    """Return the value the native engine stores for an omitted field.
+
+    Parameters
+    ----------
+    spec :
+        The declared field.
+
+    Returns
+    -------
+    object
+        The engine's default, or ``None`` for a type it leaves unset.
+    """
+    if spec.is_primary or spec.is_vector:
+        return None
+    # `convert_fields_dict_for_index` drops date_time and geo_point when their
+    # value is empty, so the engine index never sees the "" default for those.
+    if spec.ov_type in ("date_time", "geo_point"):
+        return None
+    value = TYPE_DEFAULTS.get(spec.ov_type)
+    return list(value) if isinstance(value, list) else value

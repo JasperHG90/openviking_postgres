@@ -24,6 +24,7 @@ from openviking.storage.vectordb.index.cuvs_index import (
     UnsupportedCuVSFilterError,
     matches_filter,
 )
+from openviking.storage.vectordb.utils.data_processor import DataProcessor
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
@@ -66,6 +67,34 @@ META: dict[str, Any] = {
 }
 
 FIELD_TYPES = {f["FieldName"]: f["FieldType"] for f in META["Fields"]}
+
+
+def as_reference_row(meta: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """Return the row the native engine would hold for ``record``.
+
+    The reference's validator substitutes a per-type default for every omitted
+    field, so evaluating ``matches_filter`` against the raw input dict would
+    compare this backend's SQL against this backend's own NULL model -- a
+    self-confirming oracle that can never see a defaulting divergence. Passing
+    the record through ``DataProcessor`` uses the engine's real row instead.
+
+    Parameters
+    ----------
+    meta :
+        The collection schema the record belongs to.
+    record :
+        The record as handed to ``upsert``.
+
+    Returns
+    -------
+    dict[str, Any]
+        The validated, defaulted row the engine would store.
+    """
+    fields = {f["FieldName"]: f for f in meta["Fields"]}
+    processor = DataProcessor(fields_dict=fields, tz_policy="local")
+    validated = processor.validate_and_process(record)
+    row: dict[str, Any] = processor.convert_fields_dict_for_index(validated)
+    return row
 
 
 def make_adapter(dsn: str, schema: str, **params: object) -> PgVectorCollectionAdapter:
@@ -512,12 +541,13 @@ def test_filter_semantics_match_reference(adapter: PgVectorCollectionAdapter) ->
     adapter.upsert(records)
 
     # The adapter path-encodes `uri` on write, so the Python evaluator must see
-    # the same encoded value the database stores.
+    # the same encoded value the database stores; DataProcessor then applies the
+    # engine's own defaults and conversions.
     encoded = []
     for record in records:
         row = dict(record)
         row["uri"] = PgVectorCollectionAdapter._encode_uri_field_value(row["uri"])
-        encoded.append(row)
+        encoded.append(as_reference_row(META, row))
 
     checked = 0
     skipped: list[dict[str, Any]] = []
@@ -667,7 +697,8 @@ def test_upsert_replaces_the_whole_row(adapter: PgVectorCollectionAdapter) -> No
     adapter.upsert({"id": "z", "name": "B", "vector": vec(1)})
     record = adapter.get(["z"])[0]
     assert record["name"] == "B"
-    assert "level" not in record
+    # Replaced, so `level` reverts to the engine default rather than keeping 1.
+    assert record["level"] == 0
 
 
 def test_upsert_batch_applies_in_input_order(
@@ -683,7 +714,7 @@ def test_upsert_batch_applies_in_input_order(
     )
     record = adapter.get(["w"])[0]
     assert record["name"] == "N3"
-    assert "level" not in record
+    assert record["level"] == 0
 
 
 def test_update_data_rejects_unknown_primary_key(
@@ -694,18 +725,25 @@ def test_update_data_rejects_unknown_primary_key(
         adapter.get_collection().update_data([{"id": "ghost", "name": "x"}])
 
 
-def test_conds_containing_none_matches_missing_values(
+def test_conds_containing_none_matches_a_null_column(
     adapter: PgVectorCollectionAdapter,
 ) -> None:
-    """``None in conds`` matches a row whose column is absent."""
+    """``None in conds`` matches a row whose column is genuinely unset.
+
+    Once engine defaults are applied, a scalar is never missing -- a string is
+    ``""``, an int is ``0``. Only ``date_time`` and ``geo_point`` stay NULL,
+    because the engine drops them when empty. The reference cannot be used as
+    an oracle here: ``matches_filter`` refuses ``date_time`` fields outright
+    (``UnsupportedCuVSFilterError``), so this pins our own behaviour instead.
+    """
     adapter.upsert(
         [
-            {"id": "named", "name": "alpha", "vector": vec(1)},
-            {"id": "unnamed", "vector": vec(2)},
+            {"id": "dated", "created_at": "2026-01-01T00:00:00Z", "vector": vec(1)},
+            {"id": "undated", "vector": vec(2)},
         ]
     )
-    node = {"op": "must", "field": "name", "conds": [None]}
-    assert {r["id"] for r in adapter.query(filter=node, limit=10)} == {"unnamed"}
+    node = {"op": "must", "field": "created_at", "conds": [None]}
+    assert {r["id"] for r in adapter.query(filter=node, limit=10)} == {"undated"}
 
 
 def test_range_out_on_unknown_field_matches_everything(
@@ -862,6 +900,7 @@ def test_filter_semantics_match_reference_for_remaining_types(
     rng = random.Random(20260830)
     records = [_wide_record(rng, i) for i in range(60)]
     wide_adapter.upsert(records)
+    reference_rows = [as_reference_row(WIDE_META, r) for r in records]
 
     checked = 0
     skipped: list[dict[str, Any]] = []
@@ -869,7 +908,7 @@ def test_filter_semantics_match_reference_for_remaining_types(
         try:
             expected = {
                 row["id"]
-                for row in records
+                for row in reference_rows
                 if matches_filter(row, node, WIDE_FIELD_TYPES)
             }
         except UnsupportedCuVSFilterError:
@@ -906,7 +945,11 @@ def test_range_without_bounds_matches_present_values(
     adapter.upsert(records)
 
     node = {"op": op, "field": field}
-    expected = {r["id"] for r in records if matches_filter(r, node, FIELD_TYPES)}
+    expected = {
+        r["id"]
+        for r in (as_reference_row(META, rec) for rec in records)
+        if matches_filter(r, node, FIELD_TYPES)
+    }
     actual = {r["id"] for r in adapter.query(filter=node, limit=50)}
     assert actual == expected
 
@@ -939,7 +982,11 @@ def test_bool_and_int_operands_interoperate(
     ]
     wide_adapter.upsert(records)
 
-    expected = {r["id"] for r in records if matches_filter(r, node, WIDE_FIELD_TYPES)}
+    expected = {
+        r["id"]
+        for r in (as_reference_row(WIDE_META, rec) for rec in records)
+        if matches_filter(r, node, WIDE_FIELD_TYPES)
+    }
     actual = {r["id"] for r in wide_adapter.query(filter=node, limit=50)}
     assert actual == expected
 
@@ -986,3 +1033,132 @@ def test_dense_search_still_ranks_vectors_first(
     ranked = [r["id"] for r in adapter.query(query_vector=[1.0] + [0.0] * (DIM - 1))]
     assert ranked[:2] == ["near", "far"]
     assert ranked[-1] == "novec"
+
+
+def test_omitted_fields_take_the_engine_defaults(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """An omitted scalar must hold the engine's default, not NULL.
+
+    ``DataProcessor`` builds a per-type default into the validator every write
+    passes through, so on the built-in backend an absent ``level`` is ``0``.
+    Storing NULL here made ``level == 0`` match there and miss here.
+    """
+    record = {"id": "omit", "vector": vec(1)}
+    adapter.upsert(record)
+    reference = as_reference_row(META, record)
+
+    for node in (
+        {"op": "must", "field": "level", "conds": [0]},
+        {"op": "range", "field": "level", "lte": 1},
+        {"op": "must", "field": "name", "conds": [""]},
+        {"op": "must", "field": "search_tags", "conds": []},
+    ):
+        expected = {r["id"] for r in [reference] if matches_filter(r, node, FIELD_TYPES)}
+        actual = {r["id"] for r in adapter.query(filter=node, limit=10)}
+        assert actual == expected, node
+
+    stored = adapter.get(["omit"])[0]
+    assert stored["level"] == 0
+    assert stored["name"] == ""
+    assert stored["search_tags"] == []
+
+
+def test_mixed_comparable_and_incomparable_bounds(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """A bound short-circuit must not leave its predecessor's parameter behind.
+
+    ``Range(level, gte=1, lte="5")`` binds the integer bound, then hits the
+    string bound and returns early. The orphaned parameter desynchronised the
+    whole tree and PostgreSQL rejected the statement.
+    """
+    adapter.upsert({"id": "a", "level": 3, "vector": vec(1)})
+    node = {"op": "range", "field": "level", "gte": 1, "lte": "5"}
+    assert adapter.query(filter=node, limit=10) == []
+
+    # The parameter list must still line up when the bad bound sits inside a
+    # larger tree alongside other bound operands.
+    combined = {
+        "op": "and",
+        "conds": [node, {"op": "must", "field": "id", "conds": ["a"]}],
+    }
+    assert adapter.query(filter=combined, limit=10) == []
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        {"op": "must", "field": "created_at", "conds": [True]},
+        {"op": "must_not", "field": "created_at", "conds": [True]},
+        {"op": "range", "field": "created_at", "gte": True},
+    ],
+)
+def test_bool_operand_on_datetime_does_not_raise(
+    adapter: PgVectorCollectionAdapter, node: dict[str, Any]
+) -> None:
+    """A bool against a timestamp column matches nothing rather than raising.
+
+    ``parse_datetime_to_epoch_ms`` rejects bool outright, so admitting one as a
+    comparable operand turned a correct empty result into a crash.
+    """
+    adapter.upsert({"id": "a", "created_at": "2026-01-01T00:00:00Z", "vector": vec(1)})
+    adapter.query(filter=node, limit=10)
+
+
+@pytest.mark.parametrize(
+    "node,expected",
+    [
+        ({"op": "must", "field": "level", "conds": [3.0]}, {"lvl3"}),
+        ({"op": "range", "field": "level", "gte": 2.5}, {"lvl3"}),
+        ({"op": "range", "field": "level", "lt": 2.5}, {"lvl1"}),
+    ],
+)
+def test_float_operand_against_int_column(
+    adapter: PgVectorCollectionAdapter, node: dict[str, Any], expected: set[str]
+) -> None:
+    """Python compares ``3 == 3.0``; dropping float operands lost real rows."""
+    adapter.upsert(
+        [
+            {"id": "lvl3", "level": 3, "vector": vec(1)},
+            {"id": "lvl1", "level": 1, "vector": vec(2)},
+        ]
+    )
+    assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expected
+
+
+def test_vectorless_row_scores_below_every_real_score(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """The reported score must agree with the ordering.
+
+    Mapping a NULL score to 0.0 put an embedding-less row above any negative
+    real score, so a threshold check admitted it and dropped a genuine but
+    distant match.
+    """
+    adapter.upsert(
+        [
+            {"id": "novec"},
+            {"id": "near", "vector": [1.0] + [0.0] * (DIM - 1)},
+            {"id": "far", "vector": [-1.0] + [0.0] * (DIM - 1)},
+        ]
+    )
+    results = adapter.query(query_vector=[1.0] + [0.0] * (DIM - 1), limit=10)
+    scores = [r["_score"] for r in results]
+    assert scores == sorted(scores, reverse=True), results
+    assert results[-1]["id"] == "novec"
+    assert results[-1]["_score"] < results[-2]["_score"]
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", float("nan"), float("inf")])
+def test_non_finite_numbers_are_rejected_on_write(
+    adapter: PgVectorCollectionAdapter, bad: object
+) -> None:
+    """NaN and infinity are refused, including as strings.
+
+    PostgreSQL accepts ``'NaN'`` for a numeric column and then sorts it above
+    every number, while the reference never matches it -- so every range filter
+    on that row would diverge.
+    """
+    with pytest.raises(ValueError, match="NaN and infinity"):
+        adapter.upsert({"id": "bad", "active_count": bad, "vector": vec(1)})

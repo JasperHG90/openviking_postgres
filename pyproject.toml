@@ -7,6 +7,9 @@ name = "ov-postgres"
 dynamic = ["version"]
 description = "PostgreSQL + pgvector backend for OpenViking's vector store"
 readme = "README.md"
+# ov_postgres imports and links against openviking, which is AGPL-3.0.
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 keywords = ["openviking", "pgvector", "postgresql", "vector-database"]
 classifiers = [
@@ -43,7 +46,7 @@ packages = ["src/ov_postgres"]
 # Without this the sdist sweeps in everything not gitignored -- editor config,
 # the lockfile, unrelated project files. Name what belongs in a source release.
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/README.md", "/pyproject.toml"]
+include = ["/src", "/tests", "/README.md", "/pyproject.toml", "/LICENSE"]
 
 [dependency-groups]
 dev = [

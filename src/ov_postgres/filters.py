@@ -508,7 +508,12 @@ class FilterCompiler:
             ("lte", sql.SQL("<=")),
         )
 
+        # Bounds accumulate into a local list, not the shared one: an early
+        # `return` below would otherwise leave the parameters of the bounds
+        # already processed behind, with no placeholder to consume them, and
+        # desynchronise every parameter in the rest of the filter tree.
         parts: list[sql.Composable] = []
+        bound_params: list[Any] = []
         for key, operator in comparisons:
             value = node.get(key)
             if value is None:
@@ -517,10 +522,11 @@ class FilterCompiler:
                 # `_in_range` catches TypeError and returns False, so a bound
                 # of the wrong type excludes every row rather than raising.
                 return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
-            params.append(self._coerce(spec, value))
+            bound_params.append(self._coerce(spec, value))
             parts.append(
                 sql.SQL("{} {} {}").format(col, operator, self._scalar_operand(spec))
             )
+        params.extend(bound_params)
 
         if not parts:
             # No bounds: `_in_range` still rejects NULL values.
@@ -554,13 +560,18 @@ _COMPARABLE_TYPES: dict[str, tuple[type, ...]] = {
     "string": (str,),
     "text": (str,),
     "path": (str,),
-    "int64": (int,),
+    "int64": (int, float),
     "float32": (int, float),
     "bool": (bool,),
     "list<string>": (str,),
-    "list<int64>": (int,),
+    "list<int64>": (int, float),
     "date_time": (str, int, float),
 }
+
+# Column types whose operands are converted by `parse_datetime_to_epoch_ms`,
+# which rejects bool outright. Admitting a bool here would raise on conversion
+# rather than reach `_coerce_operand`.
+_NO_BOOL_OPERAND = frozenset({"date_time"})
 
 
 def _is_comparable(spec: FieldSpec, value: object) -> bool:
@@ -592,6 +603,8 @@ def _is_comparable(spec: FieldSpec, value: object) -> bool:
         # bool(2) would be True, but the reference says `True == 2` is False.
         return isinstance(value, bool) or (isinstance(value, int) and value in (0, 1))
     if isinstance(value, bool):
+        if spec.ov_type in _NO_BOOL_OPERAND:
+            return False
         # A boolean against a numeric column compares as 1/0, as Python does.
         return any(t in allowed for t in (int, float))
     return isinstance(value, allowed)

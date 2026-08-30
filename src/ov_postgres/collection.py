@@ -30,6 +30,7 @@ from .schema import (
     GEO_LON_SUFFIX,
     CollectionSchema,
     FieldSpec,
+    default_for,
     fulltext_candidates,
 )
 
@@ -54,6 +55,13 @@ _DISTANCE: dict[str, tuple[sql.SQL, sql.SQL]] = {
 
 DEFAULT_KEYWORD_FIELDS = ("name", "description", "abstract", "tags", "search_tags")
 
+# Score given to a row with no dense vector when one was requested. Every real
+# metric produces a far larger value -- cosine bottoms out at -1, and l2/ip are
+# negated distances -- so such a row sorts last while keeping the reported
+# score monotonic with the ordering. Mapping it to 0.0 instead would place it
+# above any negative real score and let a threshold check admit it.
+_NO_VECTOR_SCORE = sql.SQL("(-1e30)")
+
 # GUC namespaces for iterative scan, as SQL literals so nothing derived from
 # configuration is spliced into a statement as raw text.
 _SCAN_GUC: dict[str, sql.SQL] = {
@@ -65,11 +73,15 @@ _SCAN_GUC: dict[str, sql.SQL] = {
 class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is untyped
     """A single OpenViking collection stored as one PostgreSQL table.
 
-    Instances are safe to share across threads: every statement runs on its own
-    pooled connection. The lock serialises *writes* to the cached schema and the
-    active distance metric; those attributes and the closed flag are read
-    without it, which is sound because each is a single reference assignment --
-    a racing reader sees the old or the new value, never a torn one.
+    Instances are safe to share across threads for the operations OpenViking
+    performs: every statement runs on its own pooled connection, and the lock
+    serialises writes to the cached schema and the active distance metric.
+
+    One caveat: :meth:`update` mutates the cached schema in place over two
+    assignments, so a reader calling :meth:`get_meta_data` concurrently with it
+    can observe the new ``raw`` alongside the old ``description``. Collection
+    metadata is written once at creation in normal use, so this is noted rather
+    than locked against on every read.
 
     Parameters
     ----------
@@ -1162,7 +1174,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         dense_vector: list[float] | None,
         sparse_vector: dict[str, float] | None,
     ) -> tuple[sql.Composable, list[Any]]:
-        """Build the ranking expression and its parameters."""
+        """Build the ranking expression and its parameters.
+
+        Returns
+        -------
+        tuple[sql.Composable, list[Any]]
+            The score expression and the parameters it binds.
+        """
         params: list[Any] = []
         terms: list[sql.Composable] = []
 
@@ -1175,7 +1193,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 sql.Placeholder(),
             )
             params.append(_format_vector(dense_vector))
-            terms.append(score_template.format(distance))
+            # COALESCE, not a bare score: a NULL dense term would otherwise
+            # swallow the sparse term too (NULL + x = NULL), sinking a strong
+            # sparse-only match below rows it should outrank.
+            terms.append(
+                sql.SQL("coalesce({}, {})").format(
+                    score_template.format(distance), _NO_VECTOR_SCORE
+                )
+            )
 
         sparse_field = self._schema.sparse_field
         if sparse_vector and sparse_field is not None and self._sparse_weight > 0:
@@ -1427,11 +1452,24 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 columns.append(spec.name)
         columns.append("extra")
 
+        # The native engine's validator substitutes a per-type default for any
+        # omitted field, so an absent `level` is 0 there rather than missing.
+        # Storing NULL instead would make the same filter match on one backend
+        # and not the other.
+        defaults: dict[str, Any] = {}
+        for spec in self._schema.fields:
+            if spec.is_geo:
+                continue
+            value = default_for(spec)
+            if value is not None:
+                defaults[spec.name] = self._adapt_value(spec, value)
+
         rows: list[list[Any]] = []
         ids: list[str] = []
         for record in data_list:
             names, values, extra = self._split_record(record)
-            mapping: dict[str, Any] = dict(zip(names, values, strict=True))
+            mapping: dict[str, Any] = dict(defaults)
+            mapping.update(dict(zip(names, values, strict=True)))
             mapping["extra"] = json.dumps(extra) if extra else "{}"
             if mapping.get(pk) is None:
                 raise ValueError(f"upsert record is missing primary key {pk!r}")
@@ -1447,14 +1485,20 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return _format_vector(value)
         if spec.is_sparse:
             return json.dumps(value) if not isinstance(value, str) else value
-        if spec.ov_type == "float32" and isinstance(value, float):
+        if spec.ov_type in ("float32", "int64"):
             # PostgreSQL sorts NaN above every number, while the reference's
             # `_in_range` returns False for every comparison against it, so a
             # stored NaN would diverge on every range filter. pgvector rejects
             # it in a vector column for the same reason; do it for scalars too.
-            if math.isnan(value) or math.isinf(value):
+            # Checked after coercion to float, because PostgreSQL accepts the
+            # strings "NaN" and "Infinity" for a real column just as readily.
+            try:
+                numeric = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                numeric = 0.0
+            if math.isnan(numeric) or math.isinf(numeric):
                 raise ValueError(
-                    f"float32 field {spec.name!r} cannot store {value!r}: "
+                    f"{spec.ov_type} field {spec.name!r} cannot store {value!r}: "
                     "NaN and infinity have no consistent ordering"
                 )
         if spec.is_datetime:

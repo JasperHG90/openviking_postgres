@@ -625,7 +625,9 @@ def test_declared_null_column_is_not_shadowed_by_extra(
                 conn.commit()
 
         record = adapter.get(["a"])[0]
-        assert "name" not in record, f"stale extra leaked: {record}"
+        # The declared column wins: it holds the engine default, not the stale
+        # copy that was planted in `extra`.
+        assert record["name"] == "", f"stale extra leaked: {record}"
     finally:
         adapter.close()
 
