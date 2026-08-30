@@ -25,6 +25,7 @@ from ov_postgres import ddl
 from ov_postgres.adapter import PgVectorCollectionAdapter
 from ov_postgres.collection import NULL_BUCKET
 from ov_postgres.filters import UnsupportedFilterError
+from ov_postgres.schema import CollectionSchema
 
 from .test_integration import (
     DIM,
@@ -2284,10 +2285,10 @@ def int_key_meta() -> dict[str, Any]:
     ("given", "stored"),
     [(7, 7), ("7", 7), (" 7 ", 7), ("7.0", 7), (7.0, 7), (True, 1)],
 )
-def test_an_integer_key_is_coerced_like_the_reference(
+def test_an_integer_key_is_written_as_the_reference_validates_it(
     dsn: str, test_schema: str, given: object, stored: int
 ) -> None:
-    """An int64 key accepts whatever pydantic's lax mode accepts.
+    """On write, an int64 key accepts whatever pydantic's lax mode accepts.
 
     The engine's validator is lax for integers where it is strict for strings,
     so refusing these would diverge in the opposite direction.
@@ -2296,10 +2297,32 @@ def test_an_integer_key_is_coerced_like_the_reference(
     try:
         adapter.upsert({"id": given, "level": 1, "vector": vec(1)})
         assert [r["id"] for r in adapter.get([stored])] == [stored]
-        assert [r["id"] for r in adapter.get([given])] == [stored]
         adapter.get_collection().update_data([{"id": given, "level": 5}])
         assert adapter.get([stored])[0]["level"] == 5
-        assert adapter.delete(ids=[given]) == 1
+        assert adapter.delete(ids=[stored]) == 1
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("given", "matches"),
+    [(7, True), ("7", True), (" 7 ", False), ("7.0", False), (7.0, False), (True, False)],
+)
+def test_an_integer_key_is_read_by_its_string_form(
+    dsn: str, test_schema: str, given: object, matches: bool
+) -> None:
+    """On read, a key matches only when its string form does.
+
+    The engine keys rows on a hash of ``str(key)``, so ``7.0`` and ``" 7 "``
+    find nothing there even though both validate as the integer 7. Coercing
+    them here would find the row and diverge.
+    """
+    adapter = build(dsn, test_schema, meta=int_key_meta())
+    try:
+        adapter.upsert({"id": 7, "level": 1, "vector": vec(1)})
+        assert bool(adapter.get([given])) is matches
+        result = adapter.get_collection().fetch_data([given])
+        assert result.ids_not_exist == ([] if matches else [given])
     finally:
         adapter.close()
 
@@ -3026,5 +3049,145 @@ def test_update_data_reports_a_missing_primary_key(dsn: str, test_schema: str) -
         adapter.upsert({"id": "a", "level": 0, "vector": vec(1)})
         with pytest.raises(ValueError, match="update_data record is missing 'id'"):
             adapter.get_collection().update_data([{"level": 9}])
+    finally:
+        adapter.close()
+
+
+def path_key_meta() -> dict[str, Any]:
+    """Return META with a path-typed primary key."""
+    meta = copy.deepcopy(META)
+    meta["Fields"] = [
+        {"FieldName": "id", "FieldType": "path", "IsPrimaryKey": True},
+        *[f for f in meta["Fields"] if f["FieldName"] != "id"],
+    ]
+    return meta
+
+
+def test_search_by_id_on_a_path_key_excludes_only_the_seed_row(
+    dsn: str, test_schema: str
+) -> None:
+    """Excluding the seed row must not exclude everything beneath it.
+
+    A path field's ``must_not`` is a subtree test, so the self-exclusion took
+    the whole subtree with it: neighbours of ``/a`` lost ``/a/b`` and
+    ``/a/b/c`` as well.
+    """
+    keys = ["/a", "/a/b", "/a/b/c", "/z"]
+    adapter = build(dsn, test_schema, meta=path_key_meta())
+    try:
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in keys])
+        result = adapter.get_collection().search_by_id("default", "/a", limit=10)
+        assert sorted(str(item.id) for item in result.data) == ["/a/b", "/a/b/c", "/z"]
+    finally:
+        adapter.close()
+
+
+def test_a_float_primary_key_is_usable(dsn: str, test_schema: str) -> None:
+    """A key type the schema parser accepts must actually work.
+
+    Without a validator the values reached the lock array unchecked, and
+    psycopg refused the resulting mixed list with ``cannot dump lists of mixed
+    types``.
+    """
+    # Mixed on purpose: without a validator these reach the lock array as
+    # float, str and int, and psycopg refuses a heterogeneous list.
+    given: list[Any] = [1.5, "-2.25", 3]
+    keys: list[Any] = [1.5, -2.25, 3.0]
+    meta = copy.deepcopy(META)
+    meta["Fields"] = [
+        {"FieldName": "id", "FieldType": "float32", "IsPrimaryKey": True},
+        *[f for f in meta["Fields"] if f["FieldName"] != "id"],
+    ]
+    adapter = build(dsn, test_schema, meta=meta)
+    try:
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in given])
+        assert sorted(str(r["id"]) for r in adapter.get(keys)) == sorted(
+            str(k) for k in keys
+        )
+        # Rewriting rows that have no embedding takes the pre-write lock,
+        # whose key array is where unvalidated mixed types are refused with
+        # `cannot dump lists of mixed types`.
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("UPDATE {}.ov_context SET vector = NULL").format(
+                    sql.Identifier(test_schema)
+                )
+            )
+            conn.commit()
+        adapter.upsert([{"id": k, "level": 1} for k in given])
+        assert adapter.get([keys[0]])[0]["level"] == 1
+        assert adapter.delete(ids=keys) == len(keys)
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("ov_type", ["bool", "vector", "geo_point"])
+def test_an_unusable_primary_key_type_is_refused_up_front(ov_type: str) -> None:
+    """A key that cannot work must fail when declared, not on the first write.
+
+    A `bool` key never reaches the database at all: OpenViking's own wrapper
+    replaces a falsy id with a generated one, so `False` arrives as a UUID.
+    """
+    meta = copy.deepcopy(META)
+    meta["Fields"] = [
+        {"FieldName": "id", "FieldType": ov_type, "IsPrimaryKey": True, "Dim": DIM},
+        *[f for f in meta["Fields"] if f["FieldName"] != "id"],
+    ]
+    with pytest.raises(ValueError, match="primary key"):
+        CollectionSchema.from_meta(meta)
+
+
+def test_a_non_finite_primary_key_is_refused(dsn: str, test_schema: str) -> None:
+    """NaN equals nothing, itself included, so a row keyed on it is lost."""
+    meta = copy.deepcopy(META)
+    meta["Fields"] = [
+        {"FieldName": "id", "FieldType": "float32", "IsPrimaryKey": True},
+        *[f for f in meta["Fields"] if f["FieldName"] != "id"],
+    ]
+    adapter = build(dsn, test_schema, meta=meta)
+    try:
+        with pytest.raises(ValueError, match="cannot store"):
+            adapter.upsert({"id": float("nan"), "level": 0, "vector": vec(1)})
+    finally:
+        adapter.close()
+
+
+def test_reads_report_an_unmatchable_key_as_missing(dsn: str, test_schema: str) -> None:
+    """A key no stored row can equal is not found, not an error.
+
+    ``LocalCollection`` hashes ``str(key)`` and simply misses, so raising here
+    would turn a lookup that returns nothing into a crash.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "level": 0, "vector": vec(1)})
+        collection = adapter.get_collection()
+        assert collection.fetch_data([None]).ids_not_exist == [None]
+        assert collection.delete_data([None]) is True
+        assert adapter.count() == 1
+        assert collection.search_by_id("default", None).data == []
+        assert collection.search_by_id("default", "   ").data == []
+    finally:
+        adapter.close()
+
+
+def test_an_integer_key_read_that_cannot_match_is_not_found(
+    dsn: str, test_schema: str
+) -> None:
+    """A lookup no bigint can equal is a miss, not a crash.
+
+    The engine hashes ``str(key)``, so ``"nope"`` and ``None`` simply find
+    nothing there. Raising would turn an empty result into an error.
+    """
+    adapter = build(dsn, test_schema, meta=int_key_meta())
+    try:
+        adapter.upsert({"id": 1, "level": 0, "vector": vec(1)})
+        collection = adapter.get_collection()
+        assert collection.fetch_data([None]).ids_not_exist == [None]
+        assert collection.fetch_data(["nope"]).ids_not_exist == ["nope"]
+        assert collection.fetch_data([1]).ids_not_exist == []
+        assert collection.search_by_id("default", "nope").data == []
+        assert collection.delete_data(["nope"]) is True
+        assert adapter.count() == 1
     finally:
         adapter.close()

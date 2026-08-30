@@ -267,8 +267,15 @@ class CollectionSchema:
             if spec is not None:
                 specs.append(spec)
 
-        if not any(spec.is_primary for spec in specs):
+        primary = next((spec for spec in specs if spec.is_primary), None)
+        if primary is None:
             raise ValueError(f"Collection {name!r} declares no primary key field")
+        if primary.ov_type in UNUSABLE_KEY_TYPES:
+            raise ValueError(
+                f"Collection {name!r} declares a {primary.ov_type!r} primary key "
+                f"({primary.name!r}), which cannot be used. "
+                f"{UNUSABLE_KEY_TYPES[primary.ov_type]}"
+            )
 
         return cls(
             name=str(name),
@@ -278,6 +285,21 @@ class CollectionSchema:
             fulltext=list(meta.get("FullText") or []),
             raw=dict(meta),
         )
+
+
+# Key types the schema format allows but that cannot work in practice, with
+# the reason, reported when the collection is defined rather than on the first
+# write that trips over them.
+UNUSABLE_KEY_TYPES: dict[str, str] = {
+    "bool": (
+        "OpenViking's own Collection wrapper generates an id whenever the "
+        "record's is falsy, so False can never reach the database -- and two "
+        "possible keys make a poor primary key regardless."
+    ),
+    "sparse_vector": "A sparse vector has no ordering and cannot be compared.",
+    "vector": "A vector has no ordering and cannot be compared.",
+    "geo_point": "A geo point is stored as two columns and cannot key a row.",
+}
 
 
 def _field_spec(raw_field: dict[str, Any]) -> FieldSpec | None:

@@ -79,11 +79,12 @@ _KEYWORD_TERMS_WARN = 1024
 # the same pydantic types the native engine validates every record against, so
 # they accept and reject exactly what it does: `3` is refused for a string key,
 # while `"7"`, `7.0` and `True` are all accepted as the integer key 7.
-_KEY_ADAPTERS: dict[str, TypeAdapter[str] | TypeAdapter[int]] = {
+_KEY_ADAPTERS: dict[str, TypeAdapter[Any]] = {
     "string": TypeAdapter(str),
     "text": TypeAdapter(str),
     "path": TypeAdapter(str),
     "int64": TypeAdapter(int),
+    "float32": TypeAdapter(float),
 }
 
 # Reported score for a row with no embedding. This is a *display* floor, not a
@@ -259,21 +260,26 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if adapter is None:
             return value
         try:
-            return adapter.validate_python(value)
+            coerced = adapter.validate_python(value)
         except PydanticValidationError as exc:
             raise ValueError(
                 f"primary key {spec.name!r} is declared {spec.ov_type!r}, "
                 f"but got {type(value).__name__}: {value!r}"
             ) from exc
+        return coerced
 
-    def _lookup_key(self, value: object) -> object:
+    def _lookup_key(self, value: object) -> object | None:
         """Convert a key supplied to a *read* into what the column stores.
 
         The engine validates writes but not reads: ``fetch_data``,
-        ``delete_data`` and the rest hash ``str(key)``, so
+        ``delete_data`` and the rest key rows on a hash of ``str(key)``, so
         ``LocalCollection.fetch_data([7])`` finds the record stored under
         ``"7"``. Refusing it here -- as the write path rightly does -- would
-        diverge in the other direction, so a read coerces instead.
+        diverge in the other direction.
+
+        Matching is on the string form for the same reason. ``7.0`` and
+        ``" 7 "`` both parse as the integer 7, but hash differently over
+        there and so find nothing; coercing them here would find the row.
 
         Parameters
         ----------
@@ -282,20 +288,19 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         Returns
         -------
-        object
-            The key as the column stores it.
-
-        Raises
-        ------
-        ValueError
-            If the value cannot be read as a key of the declared type at all.
+        object | None
+            The key as the column stores it, or ``None`` when no stored key
+            can equal it -- which the engine reports as simply not found.
         """
         spec = self._schema.primary_key
+        text = str(value)
         if spec.ov_type in ("string", "text", "path"):
-            if value is None:
-                raise ValueError(f"primary key {spec.name!r} cannot be None")
-            return str(value)
-        return self._coerce_key(value)
+            return text
+        try:
+            coerced = self._coerce_key(text)
+        except ValueError:
+            return None
+        return coerced if str(coerced) == text else None
 
     def _lookup_keys(self, values: Iterable[object]) -> list[object]:
         """Convert every key in ``values`` for a read; see :meth:`_lookup_key`.
@@ -308,14 +313,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         Returns
         -------
         list[object]
-            The keys as the column stores them, in the order given.
-
-        Raises
-        ------
-        ValueError
-            If any value cannot be read as a key of the declared type.
+            The matchable keys, in the order given. A value that no stored key
+            can equal is left out; it can only be reported as not found.
         """
-        return [self._lookup_key(value) for value in values]
+        return [
+            key
+            for key in (self._lookup_key(value) for value in values)
+            if key is not None
+        ]
 
     def _check_open(self) -> None:
         """Raise if the collection has been closed."""
@@ -1080,7 +1085,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             identifier = record.pop(pk, None)
             found.add(identifier)
             items.append(DataItem(id=identifier, fields=record))
-        missing = [key for key in keys if key not in found]
+        # Reported as the caller wrote them, as the engine does -- including a
+        # value no stored key could equal, which is simply not found.
+        missing = [
+            value
+            for value in primary_keys
+            if (lookup := self._lookup_key(value)) is None or lookup not in found
+        ]
         return FetchDataInCollectionResult(items=items, ids_not_exist=missing)
 
     def search_by_vector(
@@ -1189,7 +1200,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         vector_field = self._schema.vector_field
         if vector_field is None:
             raise ValueError("Collection has no vector field")
+        # The engine returns an empty result for these rather than raising.
+        if id is None or (isinstance(id, str) and not id.strip()):
+            return SearchResult(data=[])
         key = self._lookup_key(id)
+        if key is None:
+            return SearchResult(data=[])
         pk = self._schema.primary_key.name
 
         row = self._execute(
@@ -1203,7 +1219,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return SearchResult(data=[])
 
         vector = _parse_vector(row[vector_field.name])
-        exclusion = {"op": "must_not", "field": pk, "conds": [key]}
+        exclusion: dict[str, Any] = {"op": "must_not", "field": pk, "conds": [key]}
+        if self._schema.primary_key.is_path:
+            # A path field's `must_not` is a subtree test, so excluding the
+            # seed row would exclude every row beneath it: neighbours of `/a`
+            # would lose `/a/b` and `/a/b/c`. `-d=0` is the exact path alone.
+            exclusion["para"] = "-d=0"
         combined: dict[str, Any] = (
             {"op": "and", "conds": [filters, exclusion]} if filters else exclusion
         )
@@ -1787,12 +1808,31 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         """
         if self._index_method != "auto":
             return self._index_method
-        with self._lock:
-            cached = self._resolved_method
-            generation = self._index_generation
-        if cached is not None:
-            return cached
+        while True:
+            with self._lock:
+                cached = self._resolved_method
+                generation = self._index_generation
+            if cached is not None:
+                return cached
+            resolved = self._read_index_method()
+            with self._lock:
+                # A `create_index` that ran while the read above was in flight
+                # bumped the generation, which makes this answer stale: it
+                # describes the indexes as they were before that call. Caching
+                # it would leave the scan setting unset for good, and filtered
+                # ANN searches silently returning fewer rows than asked for.
+                if self._index_generation == generation:
+                    self._resolved_method = resolved
+                    return resolved
 
+    def _read_index_method(self) -> str:
+        """Read from the catalog which ANN method is actually built.
+
+        Returns
+        -------
+        str
+            ``flat``, ``hnsw`` or ``ivfflat``.
+        """
         rows = self._execute(
             sql.SQL(
                 "SELECT indexdef FROM pg_indexes WHERE schemaname = %s AND tablename = %s"
@@ -1809,18 +1849,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             if " using ivfflat " in definition:
                 resolved = "ivfflat"
                 break
-        with self._lock:
-            # A `create_index` that ran while the query above was in flight
-            # bumped the generation, which makes this answer stale -- it
-            # described the indexes as they were before that call. Caching it
-            # would leave the scan setting unset for good, and filtered ANN
-            # searches silently returning fewer rows than asked for.
-            if self._index_generation == generation:
-                self._resolved_method = resolved
-                return resolved
-        # The indexes changed under this read, so its answer describes a state
-        # that no longer holds. Ask again rather than cache it.
-        return self._resolved_index_method()
+        return resolved
 
     def ensure_indexes(self) -> list[str]:
         """Bring the collection's indexes in line with what this version expects.

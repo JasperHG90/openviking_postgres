@@ -350,7 +350,9 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 - **`search_by_multimodal`** raises `NotImplementedError`: it requires an embedding model this layer does not have.
 - **`geo_range`** filters raise `UnsupportedFilterError`. Geo points are stored and read back, but are not queryable by radius.
 - **TTL** on `upsert_data` is ignored, with a warning.
-- **A primary key of the wrong type is refused on write**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`. Reads are lenient, again matching: `fetch_data([3])` finds the record stored under `"3"`.
+- **`search_by_id` excludes the row it started from.** The built-in backend returns it, since it searches by that row's own vector; excluding it is a deliberate difference, not an oversight.
+- **A `bool`, `vector`, `sparse_vector` or `geo_point` primary key is refused** when the collection is defined. A `bool` key cannot work at all: OpenViking's own wrapper replaces a falsy id with a generated one, so `False` never reaches the database.
+- **A primary key of the wrong type is refused on write**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`. Reads are lenient, again matching: the engine keys rows on a hash of `str(key)`, so `fetch_data([3])` finds the record stored under `"3"` — and `[7.0]` finds nothing on an `int64` key, because `"7.0"` is not `"7"`. A key no stored row can equal is reported as not found rather than raising.
 - **`search_by_keywords` takes at most 16384 distinct terms.** Each binds two parameters against PostgreSQL's limit of 65535, and planning costs roughly a millisecond per term. Repeated terms are collapsed before any of that.
 - **Server-side grep** never routes here. OpenViking's `_resolve_grep_engine` hard-codes `("volcengine", "vikingdb")`, so grep falls back to the filesystem and the `content` field is not stored.
 
