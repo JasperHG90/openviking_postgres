@@ -350,6 +350,7 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 - **`search_by_multimodal`** raises `NotImplementedError`: it requires an embedding model this layer does not have.
 - **`geo_range`** filters raise `UnsupportedFilterError`. Geo points are stored and read back, but are not queryable by radius.
 - **TTL** on `upsert_data` is ignored, with a warning.
+- **A primary key of the wrong type is refused**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`.
 - **Server-side grep** never routes here. OpenViking's `_resolve_grep_engine` hard-codes `("volcengine", "vikingdb")`, so grep falls back to the filesystem and the `content` field is not stored.
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
@@ -398,23 +399,20 @@ print(adapter.backfill_defaults(), "rows repaired")
 adapter.close()
 ```
 
-`ensure_indexes` takes a write lock on the table for the duration of each
-index it builds, so run it during a quiet period on a large collection. It
-does not create vector indexes; those belong to `create_index`.
+Each index carries a fingerprint of the statement that built it, recorded as a
+comment on the index, so `ensure_indexes` can tell an index this package
+created from one you added yourself. Yours is left alone, as is any index a
+constraint owns. Changing `text_search_config` or `keyword_fields` re-keys the
+full-text index, which is the one case where skipping the repair leaves
+keyword search scanning the whole table.
+
+Rebuilding drops and recreates, which holds an `ACCESS EXCLUSIVE` lock on the
+table for the duration of each index — that blocks readers as well as writers,
+so run it during a quiet period on a large collection. It does not create
+vector indexes; those belong to `create_index`.
 
 `backfill_defaults` commits in batches (`batch_size=5000` by default), touches
 only columns that are NULL, and preserves a concurrent writer's value.
-
-Rows written before an embedding was required stay readable and rewritable but
-remain invisible to approximate search, since pgvector's index builds skip NULL
-vectors. Find them with:
-
-```sql
--- adjust the schema and table to your `schema` / `table_prefix` settings
-SELECT id FROM openviking.ov_context WHERE vector IS NULL;
-```
-
-Re-index those URIs through OpenViking to give them embeddings, or delete them.
 
 ## Troubleshooting
 

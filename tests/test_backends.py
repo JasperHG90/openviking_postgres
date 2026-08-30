@@ -2239,21 +2239,76 @@ def test_create_index_invalidates_the_resolved_method(dsn: str, test_schema: str
         adapter.close()
 
 
-def test_an_integer_primary_key_round_trips(dsn: str, test_schema: str) -> None:
-    """A record written with a non-string key must still be readable.
+def test_a_mistyped_key_is_refused_like_the_reference(dsn: str, test_schema: str) -> None:
+    """An integer offered for a string key must be refused, not coerced.
 
-    PostgreSQL accepts ``3`` for a text column, but every read path binds the
-    key as an integer and raises ``operator does not exist: text = smallint``.
-    The row could be written and then never read, updated or deleted.
+    The native engine validates every record with pydantic, which rejects
+    ``3`` for a string field. PostgreSQL instead writes ``"3"`` into the text
+    column, and every read then binds the key as an integer and raises
+    ``operator does not exist: text = smallint`` -- a row that can be written
+    and never read, updated or deleted.
     """
     adapter = build(dsn, test_schema)
     try:
-        adapter.upsert({"id": 3, "level": 1, "vector": vec(1)})
-        assert [r["id"] for r in adapter.get(["3"])] == ["3"]
-        adapter.get_collection().update_data([{"id": "3", "level": 2}])
-        assert adapter.get(["3"])[0]["level"] == 2
-        assert adapter.delete(ids=["3"]) == 1
+        collection = adapter.get_collection()
+        with pytest.raises(TypeError, match="declared 'string'"):
+            adapter.upsert({"id": 3, "level": 1, "vector": vec(1)})
+        with pytest.raises(TypeError, match="declared 'string'"):
+            adapter.get([3])
+        with pytest.raises(TypeError, match="declared 'string'"):
+            adapter.delete(ids=[3])
+        with pytest.raises(TypeError, match="declared 'string'"):
+            collection.update_data([{"id": 3, "level": 2}])
+        with pytest.raises(TypeError, match="declared 'string'"):
+            collection.search_by_id("default", 3)
         assert adapter.count() == 0
+    finally:
+        adapter.close()
+
+
+def int_key_meta() -> dict[str, Any]:
+    """Return META with an int64 primary key."""
+    meta = copy.deepcopy(META)
+    meta["Fields"] = [
+        {"FieldName": "id", "FieldType": "int64", "IsPrimaryKey": True},
+        *[f for f in meta["Fields"] if f["FieldName"] != "id"],
+    ]
+    return meta
+
+
+@pytest.mark.parametrize(
+    ("given", "stored"),
+    [(7, 7), ("7", 7), (" 7 ", 7), ("7.0", 7), (7.0, 7), (True, 1)],
+)
+def test_an_integer_key_is_coerced_like_the_reference(
+    dsn: str, test_schema: str, given: object, stored: int
+) -> None:
+    """An int64 key accepts whatever pydantic's lax mode accepts.
+
+    The engine's validator is lax for integers where it is strict for strings,
+    so refusing these would diverge in the opposite direction.
+    """
+    adapter = build(dsn, test_schema, meta=int_key_meta())
+    try:
+        adapter.upsert({"id": given, "level": 1, "vector": vec(1)})
+        assert [r["id"] for r in adapter.get([stored])] == [stored]
+        assert [r["id"] for r in adapter.get([given])] == [stored]
+        adapter.get_collection().update_data([{"id": given, "level": 5}])
+        assert adapter.get([stored])[0]["level"] == 5
+        assert adapter.delete(ids=[given]) == 1
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("given", ["x", 7.5, None, [], "0x1f"])
+def test_an_integer_key_refuses_what_the_reference_refuses(
+    dsn: str, test_schema: str, given: object
+) -> None:
+    """Values pydantic cannot read as an integer are refused, not passed on."""
+    adapter = build(dsn, test_schema, meta=int_key_meta())
+    try:
+        with pytest.raises((TypeError, ValueError)):
+            adapter.upsert({"id": given, "level": 1, "vector": vec(1)})
     finally:
         adapter.close()
 
@@ -2370,38 +2425,163 @@ def test_a_field_named_fts_does_not_collide_with_the_full_text_index(
         adapter.close()
 
 
-def test_concurrent_updates_do_not_deadlock_on_collation_divergent_ids(
+def test_concurrent_vectorless_upserts_do_not_deadlock(
     dsn: str, test_schema: str
 ) -> None:
     """Row locks must be taken in the order the rows are written.
 
-    ``update_data`` sorts ids with Python's ``sorted`` -- code-point order --
-    while a bare ``ORDER BY`` uses the database collation. For ids such as
-    ``a_1`` and ``a-b`` the two disagree, so the ordering added to prevent
-    deadlocks produced them instead.
+    A record arriving without an embedding is checked against the stored row
+    under ``FOR UPDATE``; every record is then written in ``sorted()`` order,
+    which is Python's code-point order. The lock query used a bare ``ORDER
+    BY``, so it followed the database collation instead -- and under
+    ``en_US.utf8`` ``a_1`` sorts before ``a-b`` while in Python it sorts after.
+    A writer sending vectorless records therefore locked those two rows in the
+    opposite order to a writer sending records with embeddings, and the pair
+    deadlocked.
     """
-    ids = ["a_1", "a-b", "a_2", "aA", "a b", "a1"]
+    keys = ["a_1", "a-b", "a_2", "a-c", "a_3", "a-d"]
     adapter = build(dsn, test_schema)
     try:
-        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in ids])
-        collection = adapter.get_collection()
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in keys])
         errors: list[BaseException] = []
 
-        def churn(order: list[str]) -> None:
+        def churn(seed: int, *, with_vectors: bool) -> None:
+            batch: list[dict[str, Any]] = [{"id": k, "level": seed} for k in keys]
+            if with_vectors:
+                for record in batch:
+                    record["vector"] = vec(1)
             try:
                 for _ in range(40):
-                    collection.update_data([{"id": k, "level": 1} for k in order])
+                    adapter.upsert(batch)
             except BaseException as exc:
                 errors.append(exc)
 
         threads = [
-            threading.Thread(target=churn, args=(list(reversed(ids)) if n % 2 else ids,))
-            for n in range(4)
+            threading.Thread(target=churn, args=(n,), kwargs={"with_vectors": n % 2 == 0})
+            for n in range(8)
         ]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
-        assert errors == []
+        assert errors == [], errors[0]
+    finally:
+        adapter.close()
+
+
+def test_ensure_indexes_skips_an_index_a_constraint_owns(
+    dsn: str, test_schema: str
+) -> None:
+    """A constraint's index cannot be dropped, so it must not be attempted.
+
+    ``DROP INDEX`` on it raises ``DependentObjectsStillExist``, which would
+    abort the run with the indexes reconciled before it already rebuilt.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP INDEX "{test_schema}".ov_context__level_idx')
+            cur.execute(
+                f'ALTER TABLE "{test_schema}".ov_context '
+                "ADD CONSTRAINT ov_context__level_idx UNIQUE (level)"
+            )
+            conn.commit()
+        assert adapter.ensure_indexes() == []
+        assert "ov_context__level_idx" in indexes_on(dsn, test_schema)
+    finally:
+        adapter.close()
+
+
+def test_keyword_paging_is_stable_when_scores_tie(dsn: str, test_schema: str) -> None:
+    """Paging a tied result set must not repeat or drop rows.
+
+    ``ts_rank`` gives every row the same score here, and without a tiebreaker
+    PostgreSQL is free to order the run differently per query -- so a page
+    boundary inside it returns some rows twice and never returns others.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": f"r{n:04d}", "name": "quick brown fox", "vector": vec(1)}
+                for n in range(300)
+            ]
+        )
+        collection = adapter.get_collection()
+        seen: list[str] = []
+        for page in range(6):
+            result = collection.search_by_keywords(
+                "default", keywords=["fox"], limit=50, offset=page * 50
+            )
+            seen.extend(str(item.id) for item in result.data)
+        assert len(seen) == 300
+        assert len(set(seen)) == 300
+    finally:
+        adapter.close()
+
+
+def test_scalar_paging_is_stable_when_the_sort_column_ties(
+    dsn: str, test_schema: str
+) -> None:
+    """The same tie problem applies when sorting on a column of equal values."""
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [{"id": f"r{n:04d}", "level": 7, "vector": vec(1)} for n in range(300)]
+        )
+        collection = adapter.get_collection()
+        seen: list[str] = []
+        for page in range(6):
+            result = collection.search_by_scalar(
+                "default", "level", limit=50, offset=page * 50, order="desc"
+            )
+            seen.extend(str(item.id) for item in result.data)
+        assert len(seen) == 300
+        assert len(set(seen)) == 300
+    finally:
+        adapter.close()
+
+
+def test_a_very_long_keyword_list_does_not_exhaust_the_parser(
+    dsn: str, test_schema: str
+) -> None:
+    """Thousands of keywords must still run.
+
+    One ``plainto_tsquery`` per term joined flat parses as a left-deep tree,
+    and the parser recurses per level: past roughly 4200 terms PostgreSQL
+    raised ``stack depth limit exceeded``.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "name": "needle", "vector": vec(1)})
+        keywords = [f"term{n}" for n in range(8000)]
+        keywords[4000] = "needle"
+        result = adapter.get_collection().search_by_keywords(
+            "default", keywords=keywords, limit=10
+        )
+        assert [str(item.id) for item in result.data] == ["a"]
+    finally:
+        adapter.close()
+
+
+def test_the_index_method_cache_is_cleared_by_a_rebuild(
+    dsn: str, test_schema: str
+) -> None:
+    """A cached resolver answer must not outlive the indexes it read.
+
+    ``create_index`` clears the cache because it just changed the indexes. A
+    resolver that read ``pg_indexes`` before that and wrote afterwards would
+    reinstate the stale answer permanently, and with it the truncated ANN
+    results the scan GUC exists to prevent.
+    """
+    adapter = build(dsn, test_schema, index_method="auto")
+    try:
+        collection = cast(Any, adapter.get_collection())._Collection__collection
+        assert collection._resolved_index_method() == "flat"
+        collection.create_index(
+            "default", {"VectorIndex": {"Distance": "cosine", "IndexType": "hnsw"}}
+        )
+        assert collection._resolved_method is None
+        assert collection._resolved_index_method() == "hnsw"
     finally:
         adapter.close()
