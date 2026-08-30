@@ -20,6 +20,8 @@ from pydantic import ValidationError
 
 from ov_postgres import ddl
 from ov_postgres.adapter import PgVectorCollectionAdapter
+from ov_postgres.collection import NULL_BUCKET
+from ov_postgres.filters import UnsupportedFilterError
 
 from .test_integration import (
     DIM,
@@ -1566,5 +1568,211 @@ def test_update_data_cannot_clear_an_embedding(dsn: str, test_schema: str) -> No
         adapter.upsert({"id": "a", "vector": vec(1)})
         with pytest.raises(ValueError, match="embedding is required"):
             adapter.get_collection().update_data([{"id": "a", "vector": None}])
+    finally:
+        adapter.close()
+
+
+def test_auto_index_method_emits_the_scan_guc(dsn: str, test_schema: str) -> None:
+    """``auto`` must not lose the iterative-scan GUC and truncate at 40 rows.
+
+    The gate read the raw configured string, so ``auto`` returned early and the
+    resolver added in the previous round was never reached — the fix was dead
+    code and the truncation it was written for was still live.
+    """
+    import random
+
+    creator = build(dsn, test_schema, index_method="hnsw")
+    try:
+        rng = random.Random(23)
+        creator.upsert(
+            [
+                {"id": f"r{i}", "vector": [rng.uniform(-1, 1) for _ in range(DIM)]}
+                for i in range(1500)
+            ]
+        )
+    finally:
+        creator.close()
+
+    # A second process only opens the collection, so the method must come from
+    # the registry rather than from instance state.
+    reopened = build_existing(dsn, test_schema, index_method="auto")
+    try:
+        inner = reopened.get_collection()._Collection__collection
+        assert inner._resolved_index_method() == "hnsw"
+        assert len(inner._iterative_scan_setup()) == 1
+
+        import psycopg
+
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'ANALYZE "{test_schema}".ov_context')
+        assert len(reopened.query(query_vector=vec(1), limit=200)) == 200
+    finally:
+        reopened.close()
+
+
+def test_null_and_empty_groups_are_counted_separately(dsn: str, test_schema: str) -> None:
+    """A NULL column and an empty string are different groups.
+
+    Folding NULL onto ``""`` collided with the real empty-string bucket, so one
+    count was silently dropped — and which one depended on GROUP BY row order.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "e1", "context_type": "", "vector": vec(1)},
+                {"id": "e2", "context_type": "", "vector": vec(2)},
+                {"id": "q", "context_type": "q", "vector": vec(3)},
+            ]
+        )
+        inner = adapter.get_collection()._Collection__collection
+        inner._execute(
+            sql.SQL("INSERT INTO {}.{} (id, vector) VALUES (%s, %s::vector)").format(
+                sql.Identifier(inner._db_schema), sql.Identifier(inner._table)
+            ),
+            ("nul", "[" + ",".join(["0.1"] * DIM) + "]"),
+        )
+
+        agg = inner.aggregate_data(
+            index_name="default", op="count", field="context_type"
+        ).agg
+        assert agg == {NULL_BUCKET: 1, "": 2, "q": 1}
+        assert sum(agg.values()) == adapter.count()
+    finally:
+        adapter.close()
+
+
+def test_overlapping_concurrent_upserts_do_not_deadlock(
+    dsn: str, test_schema: str
+) -> None:
+    """Two writers with the same ids in opposite orders must not deadlock.
+
+    ``executemany`` takes row locks in batch order, so opposing orders deadlock
+    and PostgreSQL rolls one batch back entirely. Sorting each batch by primary
+    key gives every writer the same lock order.
+    """
+    import threading
+
+    adapter = build(dsn, test_schema)
+    try:
+        ids = [f"k{i}" for i in range(30)]
+        errors: list[str] = []
+
+        def writer(forward: bool) -> None:
+            order = ids if forward else list(reversed(ids))
+            for _ in range(5):
+                try:
+                    adapter.upsert(
+                        [{"id": i, "level": 1, "vector": vec(3)} for i in order]
+                    )
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+
+        threads = [threading.Thread(target=writer, args=(i % 2 == 0,)) for i in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == [], errors
+        assert adapter.count() == len(ids)
+    finally:
+        adapter.close()
+
+
+def test_aggregate_conditions_are_validated(dsn: str, test_schema: str) -> None:
+    """An unsupported or ungrouped aggregate condition is refused, not ignored.
+
+    ``cond`` was dropped entirely when ungrouped, and unknown keys silently, so
+    a caller asking for groups above a threshold got every group back with no
+    way to notice.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        collection = adapter.get_collection()._Collection__collection
+        adapter.upsert({"id": "a", "context_type": "x", "vector": vec(1)})
+
+        with pytest.raises(ValueError, match="require a grouping field"):
+            collection.aggregate_data(index_name="default", cond={"gt": 1000})
+        with pytest.raises(ValueError, match="Unsupported aggregate condition"):
+            collection.aggregate_data(
+                index_name="default", field="context_type", cond={"eq": 2}
+            )
+        with pytest.raises(ValueError, match="must be a number"):
+            collection.aggregate_data(
+                index_name="default", field="context_type", cond={"gt": "many"}
+            )
+        with pytest.raises(ValueError, match="Cannot group on a vector"):
+            collection.aggregate_data(index_name="default", field="vector")
+    finally:
+        adapter.close()
+
+
+def test_scalar_sort_does_not_leak_the_sort_column(dsn: str, test_schema: str) -> None:
+    """An explicit projection must not gain the sort field.
+
+    ``LocalCollection.search_by_scalar`` pops it when the caller did not ask
+    for it; this returned it, so the same call produced different shapes on the
+    two backends.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "context_type": "x", "level": 3, "vector": vec(1)})
+        record = adapter.query(
+            order_by="level", order_desc=True, output_fields=["context_type"], limit=1
+        )[0]
+        assert record["context_type"] == "x"
+        assert "level" not in record
+    finally:
+        adapter.close()
+
+
+def test_keyword_terms_are_matched_literally(dsn: str, test_schema: str) -> None:
+    """Caller text must not act as tsquery operators.
+
+    Raw terms went into ``websearch_to_tsquery`` unquoted, so ``-fox`` was read
+    as negation and returned the complement of what was asked for.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "a", "name": "quick fox", "vector": vec(1)},
+                {"id": "b", "name": "slow bear", "vector": vec(2)},
+            ]
+        )
+        assert {r["id"] for r in adapter.search_by_keywords(keywords=["fox"])} == {"a"}
+        # Quoted, the leading dash is punctuation and the term tokenises to
+        # `fox`. Unquoted it was read as negation and returned {'b'} -- the
+        # complement of what the caller asked for.
+        assert {r["id"] for r in adapter.search_by_keywords(keywords=["-fox"])} == {"a"}
+        # An embedded operator is likewise matched as text, not obeyed.
+        assert adapter.search_by_keywords(keywords=["quick OR bear"]) == []
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "node,match",
+    [
+        ({"op": "must", "field": "ghost", "conds": "hello"}, "conds must be a list"),
+        (
+            {"op": "must_not", "field": "ghost", "conds": ["/a"], "para": "-d=0"},
+            "only supported for path fields",
+        ),
+    ],
+)
+def test_undeclared_fields_are_still_validated(
+    dsn: str, test_schema: str, node: dict[str, Any], match: str
+) -> None:
+    """A malformed node is refused whether or not the column exists.
+
+    The undeclared-field branch returned before the checks a declared field
+    gets, so a bad node either matched every row or leaked a raw TypeError.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        with pytest.raises(UnsupportedFilterError, match=match):
+            adapter.query(filter=node, limit=10)
     finally:
         adapter.close()

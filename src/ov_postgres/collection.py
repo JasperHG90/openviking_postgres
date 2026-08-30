@@ -55,6 +55,10 @@ _DISTANCE: dict[str, tuple[sql.SQL, sql.SQL]] = {
 
 DEFAULT_KEYWORD_FIELDS = ("name", "description", "abstract", "tags", "search_tags")
 
+# Key for the NULL group in an aggregate. A column that is NULL and one that
+# holds "" are different groups, and folding them together lost one of them.
+NULL_BUCKET = "__ov_null__"
+
 # Reported score for a row with no embedding. This is a *display* floor, not a
 # ranking sentinel: ordering never uses it, so it cannot swamp a sparse term.
 # OpenViking's HierarchicalRetriever re-sorts candidates by `_score` in Python
@@ -418,6 +422,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             with conn.cursor() as cur:
                 for statement in statements:
                     cur.execute(statement)
+                # Record the method actually built, not the one requested:
+                # OpenViking always asks for `flat`/`flat_hybrid`, so a
+                # collection configured for hnsw would otherwise be recorded as
+                # flat and every process that reopened it would resolve `auto`
+                # to the wrong answer.
+                recorded = dict(meta_data)
+                recorded["ResolvedIndexMethod"] = method
                 cur.execute(
                     sql.SQL(
                         "INSERT INTO {} (collection, index_name, meta) "
@@ -425,7 +436,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                         "ON CONFLICT (collection, index_name) "
                         "DO UPDATE SET meta = EXCLUDED.meta"
                     ).format(self._registry(ddl.REGISTRY_INDEXES)),
-                    (self._name, index_name, json.dumps(meta_data)),
+                    (self._name, index_name, json.dumps(recorded)),
                 )
 
         with self._lock:
@@ -1040,7 +1051,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         tsquery = sql.SQL("websearch_to_tsquery({}::regconfig, %s)").format(
             sql.Literal(self._text_search_config)
         )
-        query_text = " OR ".join(terms) if len(terms) > 1 else terms[0]
+        # Each term is quoted so caller text is matched literally. Unquoted,
+        # websearch_to_tsquery reads `-fox` as negation and `a OR b` as an
+        # operator, inverting the caller's intent.
+        query_text = " OR ".join(f'"{t}"' for t in (x.replace('"', " ") for x in terms))
 
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
@@ -1180,12 +1194,23 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # is not code-point order, so a text sort would disagree with the
         # built-in backend's Python sort.
         sort_col: sql.Composable = sql.Identifier(field)
-        if spec.is_textual and not spec.is_array:
+        if spec.ov_type in ("string", "text", "path"):
             sort_col = sql.SQL('{} COLLATE "C"').format(sql.Identifier(field))
+        elif spec.ov_type == "list<string>":
+            # An array of text is compared element-wise under the database
+            # collation as well: ARRAY['_x'] < ARRAY['a'] is false under
+            # en_US.utf8 and true in Python.
+            sort_col = sql.SQL('array(SELECT unnest({}) COLLATE "C")').format(
+                sql.Identifier(field)
+            )
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
-        if field not in columns:
+        # Selected so it can be used as the score, then dropped again if the
+        # caller did not ask for it -- LocalCollection.search_by_scalar does
+        # the same.
+        borrowed_sort_column = field not in columns
+        if borrowed_sort_column:
             columns = [*columns, field]
 
         statement = sql.SQL(
@@ -1205,6 +1230,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         for item, row in zip(result.data, rows or [], strict=True):
             value = row.get(field)
             item.score = float(value) if isinstance(value, (int, float)) else 0.0
+            if borrowed_sort_column and item.fields is not None:
+                item.fields.pop(field, None)
         return result
 
     def aggregate_data(
@@ -1246,6 +1273,28 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         predicate, filter_params = self._compiler.compile(filters)
 
+        if cond:
+            # Rejected rather than ignored: a caller asking for groups above a
+            # threshold and silently getting all of them has no way to notice.
+            unknown = set(cond) - {"gt", "gte", "lt", "lte"}
+            if unknown:
+                raise ValueError(
+                    f"Unsupported aggregate condition(s): {sorted(unknown)}. "
+                    "Expected any of: gt, gte, lt, lte"
+                )
+            for key, bound in cond.items():
+                if bound is not None and (
+                    isinstance(bound, bool) or not isinstance(bound, (int, float))
+                ):
+                    raise ValueError(
+                        f"Aggregate condition {key!r} must be a number, got {bound!r}"
+                    )
+            if field is None:
+                raise ValueError(
+                    "Aggregate conditions apply to groups, so they require a "
+                    "grouping field"
+                )
+
         if field is None:
             row = self._execute(
                 sql.SQL("SELECT count(*) AS total FROM {} WHERE {}").format(
@@ -1260,6 +1309,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         spec = self._schema.by_name(field)
         if spec is None:
             raise ValueError(f"Unknown aggregate field: {field!r}")
+        if spec.is_vector or spec.is_sparse:
+            raise ValueError(f"Cannot group on a {spec.ov_type} field: {field!r}")
 
         having: Statement = sql.SQL("")
         having_params: list[Any] = []
@@ -1290,10 +1341,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             having=having,
         )
         rows = self._execute(statement, [*filter_params, *having_params], fetch="all")
-        agg = {
-            ("" if row["bucket"] is None else str(row["bucket"])): int(row["total"])
-            for row in rows or []
-        }
+        agg: dict[str, Any] = {}
+        for row in rows or []:
+            bucket = row["bucket"]
+            if bucket is None:
+                # Folding NULL onto "" collided with the real empty-string
+                # bucket, so one of the two counts was silently dropped and
+                # which one depended on GROUP BY row order.
+                key = NULL_BUCKET
+            else:
+                key = str(bucket)
+            agg[key] = agg.get(key, 0) + int(row["total"])
         return AggregateResult(agg=agg, op=op, field=field)
 
     def _has_vector_expression(self) -> Statement:
@@ -1437,7 +1495,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         """
         if self._iterative_scan == "off":
             return []
-        if self._index_method not in ("hnsw", "ivfflat"):
+        method = self._resolved_index_method()
+        if method not in ("hnsw", "ivfflat"):
             return []
         if self._pgvector_version < ddl.MIN_VERSION_ITERATIVE_SCAN:
             logger.debug(
@@ -1447,11 +1506,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
             return []
 
-        guc = _SCAN_GUC.get(self._resolved_index_method())
+        guc = _SCAN_GUC.get(method)
         if guc is None:
             return []
         mode = self._iterative_scan
-        if self._index_method == "ivfflat" and mode == "strict_order":
+        if method == "ivfflat" and mode == "strict_order":
             mode = "relaxed_order"
         return [
             sql.SQL("SET LOCAL {}.iterative_scan = {}").format(guc, sql.Literal(mode))
@@ -1474,6 +1533,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if self._index_method != "auto":
             return self._index_method
         meta = self.get_index_meta_data(self._index_name) or {}
+        recorded = meta.get("ResolvedIndexMethod")
+        if isinstance(recorded, str) and recorded in ("flat", "hnsw", "ivfflat"):
+            return recorded
+        # Written before the resolution was recorded: fall back to the request.
         index_type = str((meta.get("VectorIndex") or {}).get("IndexType") or "flat")
         return "flat" if index_type.lower().startswith("flat") else "hnsw"
 
@@ -1701,6 +1764,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             ids.append(str(mapping[pk]))
             rows.append([mapping.get(name) for name in columns])
 
+        # Sorted by primary key so concurrent batches touching the same rows
+        # take their locks in the same order. Without it, two writers with
+        # overlapping ids in opposite orders deadlock and PostgreSQL rolls one
+        # batch back entirely. `sorted` is stable, so the documented
+        # last-occurrence-wins behaviour for a repeated key is preserved.
+        # `ids` keeps input order, because the caller is told which keys were
+        # written, not in which order they hit the database.
+        rows = [row for _, row in sorted(zip(ids, rows, strict=True), key=lambda p: p[0])]
         return columns, rows, ids, vectorless
 
     def _reject_new_vectorless(self, cur: Cursor[Any], ids: list[str]) -> None:

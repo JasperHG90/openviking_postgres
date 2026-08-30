@@ -381,13 +381,19 @@ def scalar_index_statements(
             continue
         index_name = f"{table}__{name}_idx"
         method = sql.SQL("gin") if spec.is_array else sql.SQL("btree")
+        # Range comparisons on text run under COLLATE "C" so they agree with
+        # the reference's code-point ordering; a btree in the database
+        # collation cannot serve them, so the index is built collated too.
+        indexed: sql.Composable = sql.Identifier(name)
+        if spec.is_textual and not spec.is_array:
+            indexed = sql.SQL('{} COLLATE "C"').format(sql.Identifier(name))
         statements.append(
             sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({})").format(
                 sql.Identifier(index_name),
                 sql.Identifier(schema_name),
                 sql.Identifier(table),
                 method,
-                sql.Identifier(name),
+                indexed,
             )
         )
         # Path fields are also queried by prefix; a text_pattern_ops index lets

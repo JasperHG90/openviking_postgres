@@ -173,6 +173,15 @@ class FilterCompiler:
 
         spec = self._schema.by_name(field_name)
         if spec is None:
+            # Validate exactly as a declared field would be: the reference
+            # refuses a malformed node whether or not the column exists.
+            conds = node.get("conds")
+            if op in _COND_OPS and conds is not None and not isinstance(conds, list):
+                raise UnsupportedFilterError(f"{op} filter conds must be a list")
+            if op in ("must", "must_not") and node.get("para") not in (None, ""):
+                raise UnsupportedFilterError(
+                    f"Filter parameters are only supported for path fields: {node!r}"
+                )
             # An undeclared field has no value, so the reference evaluates
             # against None: `must` and `contains` fail, while the negated
             # forms (`must_not`, `range_out`) succeed.
