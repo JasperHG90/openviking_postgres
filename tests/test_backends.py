@@ -8,7 +8,9 @@ dense+sparse scoring.
 
 from __future__ import annotations
 
+import copy
 import math
+import threading
 from typing import Any, cast
 
 import psycopg
@@ -35,7 +37,12 @@ pytestmark = pytest.mark.integration
 
 
 def build(
-    dsn: str, schema: str, *, sparse_weight: float = 0.0, **params: object
+    dsn: str,
+    schema: str,
+    *,
+    sparse_weight: float = 0.0,
+    meta: dict[str, Any] | None = None,
+    **params: object,
 ) -> PgVectorCollectionAdapter:
     """Create an adapter and its collection with the given options."""
     config = VectorDBBackendConfig(
@@ -49,7 +56,7 @@ def build(
     adapter = PgVectorCollectionAdapter.from_config(config)
     adapter.create_collection(
         "context",
-        META,
+        META if meta is None else meta,
         distance=config.distance_metric,
         sparse_weight=sparse_weight,
         index_name="default",
@@ -2273,8 +2280,8 @@ def test_ensure_indexes_is_idempotent_with_full_text(dsn: str, test_schema: str)
     """A full-text index must not be rebuilt on every run.
 
     Its key is an expression PostgreSQL rewrites heavily, so it can never match
-    our SQL textually. Reconciliation is restricted to simple column indexes;
-    attempting it on an expression would rebuild forever.
+    the statement textually. Matching on a fingerprint recorded at creation
+    lets it be reconciled without rebuilding for ever.
     """
     adapter = build(dsn, test_schema)
     try:
@@ -2282,5 +2289,119 @@ def test_ensure_indexes_is_idempotent_with_full_text(dsn: str, test_schema: str)
         assert adapter.ensure_indexes() == []
         assert adapter.ensure_indexes() == []
         assert "ov_context__fts_idx" in indexes_on(dsn, test_schema)
+    finally:
+        adapter.close()
+
+
+def test_ensure_indexes_rebuilds_the_full_text_index_after_a_config_change(
+    dsn: str, test_schema: str
+) -> None:
+    """Changing ``text_search_config`` must re-key the full-text index.
+
+    The index stores lexemes produced by one configuration. A query parsed
+    under another cannot use it, so the recommended switch to ``english``
+    would otherwise leave every keyword search scanning the table.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "name": "running", "vector": vec(1)})
+        assert "'simple'" in indexes_on(dsn, test_schema)["ov_context__fts_idx"]
+    finally:
+        adapter.close()
+
+    adapter = build_existing(dsn, test_schema, text_search_config="english")
+    try:
+        assert adapter.ensure_indexes() == ["ov_context__fts_idx"]
+        assert "'english'" in indexes_on(dsn, test_schema)["ov_context__fts_idx"]
+        assert adapter.ensure_indexes() == []
+    finally:
+        adapter.close()
+
+
+def test_ensure_indexes_leaves_indexes_it_did_not_create_alone(
+    dsn: str, test_schema: str
+) -> None:
+    """A user's own index must survive reconciliation.
+
+    Reconciliation drops and recreates, so touching an index this package did
+    not create would silently destroy someone's tuning.
+    """
+    import psycopg
+
+    adapter = build(dsn, test_schema)
+    try:
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f'CREATE INDEX mine_idx ON "{test_schema}".ov_context (level, name)'
+            )
+            conn.commit()
+        assert adapter.ensure_indexes() == []
+        assert "mine_idx" in indexes_on(dsn, test_schema)
+    finally:
+        adapter.close()
+
+
+def test_a_field_named_fts_does_not_collide_with_the_full_text_index(
+    dsn: str, test_schema: str
+) -> None:
+    """Two indexes must never resolve to one name.
+
+    Joining name parts with underscores is ambiguous: a scalar index on a field
+    called ``fts`` yields ``ov_context__fts_idx``, which is also the fixed name
+    of the full-text index. Both would then be created under that name, each
+    run destroying the other's.
+    """
+    meta = copy.deepcopy(META)
+    meta["Fields"].append({"FieldName": "fts", "FieldType": "string"})
+    meta["ScalarIndex"].append("fts")
+    adapter = build(dsn, test_schema, meta=meta)
+    try:
+        names = indexes_on(dsn, test_schema)
+        fts_index = names["ov_context__fts_idx"]
+        assert "gin" in fts_index and "to_tsvector" in fts_index
+        scalar = [
+            definition
+            for name, definition in names.items()
+            if name.startswith("ov_context__fts_idx_") and "to_tsvector" not in definition
+        ]
+        assert len(scalar) == 1, names
+        assert adapter.ensure_indexes() == []
+    finally:
+        adapter.close()
+
+
+def test_concurrent_updates_do_not_deadlock_on_collation_divergent_ids(
+    dsn: str, test_schema: str
+) -> None:
+    """Row locks must be taken in the order the rows are written.
+
+    ``update_data`` sorts ids with Python's ``sorted`` -- code-point order --
+    while a bare ``ORDER BY`` uses the database collation. For ids such as
+    ``a_1`` and ``a-b`` the two disagree, so the ordering added to prevent
+    deadlocks produced them instead.
+    """
+    ids = ["a_1", "a-b", "a_2", "aA", "a b", "a1"]
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in ids])
+        collection = adapter.get_collection()
+        errors: list[BaseException] = []
+
+        def churn(order: list[str]) -> None:
+            try:
+                for _ in range(40):
+                    collection.update_data([{"id": k, "level": 1} for k in order])
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=churn, args=(list(reversed(ids)) if n % 2 else ids,))
+            for n in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
     finally:
         adapter.close()

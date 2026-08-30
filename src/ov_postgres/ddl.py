@@ -136,7 +136,7 @@ def bootstrap_statements(
     ]
 
 
-def index_name(table: str, *parts: str) -> str:
+def index_name(table: str, *parts: str, taken: set[str] | None = None) -> str:
     """Build an index name that stays distinct after PostgreSQL truncates it.
 
     PostgreSQL silently truncates an identifier at 63 bytes, so
@@ -154,6 +154,12 @@ def index_name(table: str, *parts: str) -> str:
         Table the index is on.
     parts :
         Name components, joined with underscores after the table.
+    taken :
+        Names already assigned for this table. Joining with underscores is
+        ambiguous -- a field called ``fts`` yields the same name as the
+        full-text index, and a field called ``x_c`` the same as the collated
+        index on ``x`` -- so a candidate already in this set gets a digest
+        suffix. Passing the set also records the name that was handed out.
 
     Returns
     -------
@@ -161,13 +167,21 @@ def index_name(table: str, *parts: str) -> str:
         An index name of at most 63 bytes, distinct for distinct inputs.
     """
     candidate = f"{table}__{'_'.join(parts)}"
+    if taken is not None and candidate in taken:
+        collision = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:8]
+        candidate = f"{candidate}_{collision}"
+    if taken is not None:
+        taken.add(candidate)
     if len(candidate.encode("utf-8")) <= _MAX_IDENTIFIER_BYTES:
         return candidate
     digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:8]
     suffix = f"_{digest}"
     keep = _MAX_IDENTIFIER_BYTES - len(suffix)
     trimmed = candidate.encode("utf-8")[:keep].decode("utf-8", "ignore")
-    return f"{trimmed}{suffix}"
+    truncated = f"{trimmed}{suffix}"
+    if taken is not None:
+        taken.add(truncated)
+    return truncated
 
 
 def _path_matches_fn(schema_name: str) -> Statement:
@@ -390,7 +404,7 @@ def create_table(schema_name: str, table: str, coll: CollectionSchema) -> Statem
 
 
 def scalar_index_statements(
-    schema_name: str, table: str, coll: CollectionSchema
+    schema_name: str, table: str, coll: CollectionSchema, taken: set[str] | None = None
 ) -> list[Statement]:
     """Build an index for every field named in ``ScalarIndex``.
 
@@ -405,6 +419,8 @@ def scalar_index_statements(
         Table name.
     coll :
         Parsed collection schema.
+    taken :
+        Names already assigned for this table; see :func:`index_name`.
 
     Returns
     -------
@@ -416,7 +432,7 @@ def scalar_index_statements(
         spec = coll.by_name(name)
         if spec is None or spec.is_vector or spec.is_sparse or spec.is_geo:
             continue
-        plain_name = index_name(table, name, "idx")
+        plain_name = index_name(table, name, "idx", taken=taken)
         method = sql.SQL("gin") if spec.is_array else sql.SQL("btree")
         statements.append(
             sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({})").format(
@@ -435,7 +451,7 @@ def scalar_index_statements(
         if spec.is_textual and not spec.is_array:
             statements.append(
                 sql.SQL('CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} COLLATE "C")').format(
-                    sql.Identifier(index_name(table, name, "c_idx")),
+                    sql.Identifier(index_name(table, name, "c_idx", taken=taken)),
                     sql.Identifier(schema_name),
                     sql.Identifier(table),
                     sql.Identifier(name),
@@ -448,7 +464,7 @@ def scalar_index_statements(
                 sql.SQL(
                     "CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} text_pattern_ops)"
                 ).format(
-                    sql.Identifier(index_name(table, name, "prefix_idx")),
+                    sql.Identifier(index_name(table, name, "prefix_idx", taken=taken)),
                     sql.Identifier(schema_name),
                     sql.Identifier(table),
                     sql.Identifier(name),
@@ -479,6 +495,7 @@ def vector_index_statement(
     distance: str,
     method: str,
     options: dict[str, Any] | None = None,
+    taken: set[str] | None = None,
 ) -> Statement | None:
     """Build the ANN index statement, or ``None`` for exact search.
 
@@ -527,7 +544,7 @@ def vector_index_statement(
         )
 
     statement = sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({} {})").format(
-        sql.Identifier(index_name(table, spec.name, method, "idx")),
+        sql.Identifier(index_name(table, spec.name, method, "idx", taken=taken)),
         sql.Identifier(schema_name),
         sql.Identifier(table),
         ann_method,
@@ -544,7 +561,11 @@ def vector_index_statement(
 
 
 def fulltext_index_statement(
-    schema_name: str, table: str, specs: list[FieldSpec], regconfig: str
+    schema_name: str,
+    table: str,
+    specs: list[FieldSpec],
+    regconfig: str,
+    taken: set[str] | None = None,
 ) -> Statement | None:
     """Build the GIN index backing keyword search.
 
@@ -558,6 +579,8 @@ def fulltext_index_statement(
         Text columns to include.
     regconfig :
         PostgreSQL text search configuration.
+    taken :
+        Names already assigned for this table; see :func:`index_name`.
 
     Returns
     -------
@@ -567,7 +590,7 @@ def fulltext_index_statement(
     if not specs:
         return None
     return sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING gin ({})").format(
-        sql.Identifier(index_name(table, "fts_idx")),
+        sql.Identifier(index_name(table, "fts_idx", taken=taken)),
         sql.Identifier(schema_name),
         sql.Identifier(table),
         tsvector_expr(specs, regconfig, schema_name),
