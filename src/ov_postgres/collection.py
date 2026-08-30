@@ -177,6 +177,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         self._iterative_scan = iterative_scan
         self._pgvector_version = pgvector_version
         self._index_name = index_name
+        self._resolved_method: str | None = None
         self._closed = False
         self._lock = threading.RLock()
         self._compiler = FilterCompiler(
@@ -685,9 +686,34 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         updated: list[str] = []
         missing: list[str] = []
         self._check_open()
+        # Checked before writing anything: LocalCollection.update_data raises
+        # before it writes, so a batch naming an unknown key must not commit
+        # its other records first.
+        keys = [str(r[pk]) for r in data_list if pk in r]
+        known = {
+            str(row[pk])
+            for row in self._execute(
+                sql.SQL("SELECT {pk} FROM {table} WHERE {pk} = ANY(%s)").format(
+                    pk=sql.Identifier(pk), table=self._qualified
+                ),
+                (keys,),
+                fetch="all",
+            )
+            or []
+        }
+        absent = [k for k in keys if k not in known]
+        if absent:
+            raise ValueError(
+                f"record not found for primary key(s): {', '.join(sorted(absent))}"
+            )
+
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                for record in data_list:
+                # Sorted by primary key for the same reason upsert sorts:
+                # every writer must take row locks in one order or two batches
+                # touching the same rows deadlock. Upsert sorting alone was not
+                # enough -- it made previously-safe mixed workloads deadlock.
+                for record in sorted(data_list, key=lambda r: str(r.get(pk))):
                     if pk not in record:
                         raise ValueError(f"update_data record is missing {pk!r}")
                     if (
@@ -1048,13 +1074,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         tsvector = ddl.tsvector_expr(specs, self._text_search_config, self._db_schema)
         # websearch_to_tsquery accepts free-form user input without throwing on
         # punctuation, unlike to_tsquery.
-        tsquery = sql.SQL("websearch_to_tsquery({}::regconfig, %s)").format(
+        # plainto_tsquery, not websearch_to_tsquery: the latter honours `-`,
+        # `OR` and quotes as operators, so `-fox` returned the complement of
+        # what the caller asked for. Quoting each term instead made every
+        # multi-word search a phrase search. plainto_tsquery ANDs the terms and
+        # treats punctuation as text, which is the literal matching wanted.
+        tsquery = sql.SQL("plainto_tsquery({}::regconfig, %s)").format(
             sql.Literal(self._text_search_config)
         )
-        # Each term is quoted so caller text is matched literally. Unquoted,
-        # websearch_to_tsquery reads `-fox` as negation and `a OR b` as an
-        # operator, inverting the caller's intent.
-        query_text = " OR ".join(f'"{t}"' for t in (x.replace('"', " ") for x in terms))
+        query_text = " ".join(terms)
 
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
@@ -1188,6 +1216,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         spec = self._schema.by_name(field)
         if spec is None:
             raise ValueError(f"Unknown sort field: {field!r}")
+        if spec.is_vector or spec.is_sparse:
+            raise ValueError(f"Cannot sort on a {spec.ov_type} field: {field!r}")
 
         direction = sql.SQL("DESC") if str(order).lower() == "desc" else sql.SQL("ASC")
         # Same reason as the range comparisons: PostgreSQL's default collation
@@ -1199,10 +1229,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         elif spec.ov_type == "list<string>":
             # An array of text is compared element-wise under the database
             # collation as well: ARRAY['_x'] < ARRAY['a'] is false under
-            # en_US.utf8 and true in Python.
-            sort_col = sql.SQL('array(SELECT unnest({}) COLLATE "C")').format(
-                sql.Identifier(field)
-            )
+            # en_US.utf8 and true in Python. The CASE keeps NULL as NULL --
+            # array(SELECT unnest(NULL)) is the *empty* array, which would make
+            # a NULL column sort with the empty ones instead of last.
+            sort_col = sql.SQL(
+                "CASE WHEN {col} IS NULL THEN NULL "
+                'ELSE array(SELECT unnest({col}) COLLATE "C") END'
+            ).format(col=sql.Identifier(field))
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
@@ -1289,7 +1322,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     raise ValueError(
                         f"Aggregate condition {key!r} must be a number, got {bound!r}"
                     )
-            if field is None:
+            if field is None and any(v is not None for v in cond.values()):
                 raise ValueError(
                     "Aggregate conditions apply to groups, so they require a "
                     "grouping field"
@@ -1341,17 +1374,19 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             having=having,
         )
         rows = self._execute(statement, [*filter_params, *having_params], fetch="all")
+        buckets = [(row["bucket"], int(row["total"])) for row in rows or []]
+        # The NULL group needs a key of its own -- folding it onto "" collided
+        # with the real empty-string group and silently dropped one count. The
+        # sentinel is extended until it collides with nothing the column
+        # actually holds, so a row literally containing it stays its own group.
+        present = {str(b) for b, _ in buckets if b is not None}
+        null_key = NULL_BUCKET
+        while null_key in present:
+            null_key += "_"
+
         agg: dict[str, Any] = {}
-        for row in rows or []:
-            bucket = row["bucket"]
-            if bucket is None:
-                # Folding NULL onto "" collided with the real empty-string
-                # bucket, so one of the two counts was silently dropped and
-                # which one depended on GROUP BY row order.
-                key = NULL_BUCKET
-            else:
-                key = str(bucket)
-            agg[key] = agg.get(key, 0) + int(row["total"])
+        for bucket, total in buckets:
+            agg[null_key if bucket is None else str(bucket)] = total
         return AggregateResult(agg=agg, op=op, field=field)
 
     def _has_vector_expression(self) -> Statement:
@@ -1519,11 +1554,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
     def _resolved_index_method(self) -> str:
         """Return the index method actually in force for this collection.
 
-        ``auto`` defers to whatever the index bundle requested, and that
-        decision lives in the registry rather than on the instance: a process
-        that merely *opens* an existing collection never runs ``create_index``,
-        so latching the resolution at creation time left every other process
-        seeing ``auto`` and emitting no iterative-scan GUC.
+        Read from ``pg_indexes`` rather than the registry: a collection created
+        by an earlier version has no recorded resolution, and
+        ``CollectionAdapter.create_collection`` returns early for an existing
+        collection, so ``create_index`` never runs again to write one. The
+        indexes themselves are the only reliable record of what was built.
+
+        Cached after the first lookup, since the answer cannot change without
+        ``create_index`` running.
 
         Returns
         -------
@@ -1532,13 +1570,79 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         """
         if self._index_method != "auto":
             return self._index_method
-        meta = self.get_index_meta_data(self._index_name) or {}
-        recorded = meta.get("ResolvedIndexMethod")
-        if isinstance(recorded, str) and recorded in ("flat", "hnsw", "ivfflat"):
-            return recorded
-        # Written before the resolution was recorded: fall back to the request.
-        index_type = str((meta.get("VectorIndex") or {}).get("IndexType") or "flat")
-        return "flat" if index_type.lower().startswith("flat") else "hnsw"
+        if self._resolved_method is not None:
+            return self._resolved_method
+
+        rows = self._execute(
+            sql.SQL(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = %s AND tablename = %s"
+            ),
+            (self._db_schema, self._table),
+            fetch="all",
+        )
+        resolved = "flat"
+        for row in rows or []:
+            definition = str(row["indexdef"]).lower()
+            if " using hnsw " in definition:
+                resolved = "hnsw"
+                break
+            if " using ivfflat " in definition:
+                resolved = "ivfflat"
+                break
+        self._resolved_method = resolved
+        return resolved
+
+    def ensure_indexes(self) -> list[str]:
+        """Create any index this version expects but the database lacks.
+
+        ``CollectionAdapter.create_collection`` returns early when the
+        collection already exists, so ``create_index`` never runs again and a
+        database created by an earlier version keeps whatever indexes it had.
+        This brings it up to date; every statement is ``IF NOT EXISTS``, so it
+        is safe to run repeatedly.
+
+        Returns
+        -------
+        list[str]
+            Names of indexes that were missing before this ran.
+        """
+        self._check_open()
+        before = {
+            str(row["indexname"])
+            for row in self._execute(
+                sql.SQL(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = %s AND tablename = %s"
+                ),
+                (self._db_schema, self._table),
+                fetch="all",
+            )
+            or []
+        }
+        statements = ddl.scalar_index_statements(
+            self._db_schema, self._table, self._schema
+        )
+        fts = ddl.fulltext_index_statement(
+            self._db_schema,
+            self._table,
+            self._fulltext_specs(),
+            self._text_search_config,
+        )
+        if fts is not None:
+            statements.append(fts)
+
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement)
+            cur.execute(
+                sql.SQL(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = %s AND tablename = %s"
+                ),
+                (self._db_schema, self._table),
+            )
+            after = {str(row[0]) for row in cur.fetchall()}
+        return sorted(after - before)
 
     def _fulltext_specs(self) -> list[FieldSpec]:
         """Return the schema fields backing keyword search.
@@ -1804,10 +1908,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return
         pk = sql.Identifier(self._schema.primary_key.name)
         cur.execute(
-            sql.SQL("SELECT {pk} FROM {table} WHERE {pk} = ANY(%s) FOR UPDATE").format(
-                pk=pk, table=self._qualified
-            ),
-            (ids,),
+            sql.SQL(
+                "SELECT {pk} FROM {table} WHERE {pk} = ANY(%s) ORDER BY {pk} FOR UPDATE"
+            ).format(pk=pk, table=self._qualified),
+            (sorted(ids),),
         )
         existing = {str(row[0]) for row in cur.fetchall()}
         new = [i for i in ids if i not in existing]

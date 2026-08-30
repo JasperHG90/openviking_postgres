@@ -392,6 +392,22 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         inner: PgVectorCollection = collection._Collection__collection
         return inner.backfill_defaults(batch_size=batch_size)
 
+    def ensure_indexes(self) -> list[str]:
+        """Create any index this version expects but the database lacks.
+
+        OpenViking skips ``create_index`` for a collection that already exists,
+        so a database created by an earlier version of this package keeps the
+        indexes it had. Run this once after upgrading.
+
+        Returns
+        -------
+        list[str]
+            Names of indexes that were missing before this ran.
+        """
+        collection = self.get_collection()
+        inner: PgVectorCollection = collection._Collection__collection
+        return inner.ensure_indexes()
+
     def close(self) -> None:
         """Release the collection handle and close the connection pool."""
         super().close()

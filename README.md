@@ -376,13 +376,24 @@ Re-index those URIs through OpenViking to give them embeddings, or delete them.
 
 ## Upgrading an existing database
 
+Two repairs apply after upgrading this package. Both are idempotent.
+
+OpenViking skips index creation for a collection that already exists, so a
+database written by an earlier version keeps whatever indexes it had — which
+can leave approximate search silently returning fewer rows than requested, and
+text range filters scanning the whole table:
+
+```python
+print(adapter.ensure_indexes(), "indexes added")
+```
+
+Then repair rows stored before per-type defaults were applied:
+
 Omitted fields are stored with the engine's own defaults — an absent `level` is
 `0`, an absent `name` is `""` — so a filter behaves the same here as on the
 built-in backend. Rows written by an earlier version of this package kept NULL
 instead, so a database that predates it holds two populations and `level == 0`
 finds only the newer rows.
-
-Repair it once:
 
 ```python
 from openviking_cli.utils.config import get_openviking_config

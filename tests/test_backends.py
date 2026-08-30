@@ -1776,3 +1776,273 @@ def test_undeclared_fields_are_still_validated(
             adapter.query(filter=node, limit=10)
     finally:
         adapter.close()
+
+
+def test_equality_and_range_both_use_an_index(dsn: str, test_schema: str) -> None:
+    """A collated index must not displace the plain one.
+
+    PostgreSQL matches an expression index syntactically, so replacing the
+    plain btree with ``(col COLLATE "C")`` left a bare ``col = ANY(...)`` --
+    by far the commonest filter shape -- with no index at all.
+    """
+    import random
+
+    import psycopg
+
+    adapter = build(dsn, test_schema)
+    try:
+        rng = random.Random(31)
+        adapter.upsert(
+            [
+                {
+                    "id": f"r{i}",
+                    "name": f"nm{i:07d}",
+                    "vector": [rng.uniform(-1, 1) for _ in range(DIM)],
+                }
+                for i in range(5000)
+            ]
+        )
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'ANALYZE "{test_schema}".ov_context')
+            for query in (
+                f'SELECT id FROM "{test_schema}".ov_context '
+                "WHERE name = ANY(ARRAY['nm0000777'])",
+                f'SELECT id FROM "{test_schema}".ov_context '
+                "WHERE name COLLATE \"C\" > 'nm0004990'",
+            ):
+                cur.execute("EXPLAIN " + query)
+                plan = "\n".join(row[0] for row in cur.fetchall())
+                assert "Index" in plan, plan
+                assert "Seq Scan" not in plan, plan
+    finally:
+        adapter.close()
+
+
+def test_an_upgraded_database_recovers_index_behaviour(
+    dsn: str, test_schema: str
+) -> None:
+    """The index fixes must reach a collection created by an older version.
+
+    ``CollectionAdapter.create_collection`` returns early when the collection
+    exists, so ``create_index`` never runs again: the resolved method was never
+    recorded and the collated indexes were never built. Resolution now reads
+    ``pg_indexes``, and ``ensure_indexes`` supplies the missing indexes.
+    """
+    import random
+
+    import psycopg
+
+    creator = build(dsn, test_schema, index_method="hnsw")
+    try:
+        rng = random.Random(33)
+        creator.upsert(
+            [
+                {
+                    "id": f"r{i}",
+                    "name": f"n{i:06d}",
+                    "vector": [rng.uniform(-1, 1) for _ in range(DIM)],
+                }
+                for i in range(1500)
+            ]
+        )
+    finally:
+        creator.close()
+
+    # Make it look like a database written before round 10.
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT indexname FROM pg_indexes "
+            "WHERE schemaname = %s AND indexname LIKE %s",
+            (test_schema, "%_c_idx"),
+        )
+        legacy = [row[0] for row in cur.fetchall()]
+        for name in legacy:
+            cur.execute(
+                sql.SQL("DROP INDEX {}.{}").format(
+                    sql.Identifier(test_schema), sql.Identifier(name)
+                )
+            )
+        cur.execute(
+            sql.SQL(
+                "UPDATE {}.ov_indexes SET meta = meta - 'ResolvedIndexMethod'"
+            ).format(sql.Identifier(test_schema))
+        )
+    assert legacy, "expected collated indexes to exist before the downgrade"
+
+    reopened = build_existing(dsn, test_schema, index_method="auto")
+    try:
+        inner = reopened.get_collection()._Collection__collection
+        # Resolved from the indexes that exist, not from a registry key an
+        # older database never wrote.
+        assert inner._resolved_index_method() == "hnsw"
+        assert len(inner._iterative_scan_setup()) == 1
+
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'ANALYZE "{test_schema}".ov_context')
+        assert len(reopened.query(query_vector=vec(1), limit=200)) == 200
+
+        assert sorted(reopened.ensure_indexes()) == sorted(legacy)
+        assert reopened.ensure_indexes() == []
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "query,expect",
+    [
+        ("quick fox", {"d1"}),
+        ("fox", {"d1"}),
+        ("-fox", {"d1"}),
+        ("quick OR bear", set()),
+    ],
+)
+def test_keyword_search_is_literal_and_not_a_phrase(
+    dsn: str, test_schema: str, query: str, expect: set[str]
+) -> None:
+    """Multi-word search must AND its terms, not require adjacency.
+
+    Quoting each term stopped ``-fox`` acting as negation but turned every
+    multi-word query into a phrase query, so ``"quick fox"`` no longer matched
+    "the quick brown fox". ``plainto_tsquery`` ANDs terms and treats
+    punctuation as text.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "d1", "name": "the quick brown fox", "vector": vec(1)},
+                {"id": "d2", "name": "slow bear", "vector": vec(2)},
+            ]
+        )
+        assert {r["id"] for r in adapter.search_by_keywords(query=query)} == expect
+    finally:
+        adapter.close()
+
+
+def test_mixed_upsert_and_update_do_not_deadlock(dsn: str, test_schema: str) -> None:
+    """Sorting upsert batches alone was not enough.
+
+    ``update_data`` still locked in caller order, so a workload where every
+    caller agreed on an order -- previously safe -- began deadlocking once
+    upsert reordered to sorted.
+    """
+    import threading
+
+    adapter = build(dsn, test_schema)
+    try:
+        ids = [f"k{i}" for i in range(40)]
+        adapter.upsert([{"id": i, "level": 0, "vector": vec(3)} for i in ids])
+        errors: list[str] = []
+
+        def upserter(forward: bool) -> None:
+            order = ids if forward else list(reversed(ids))
+            for _ in range(5):
+                try:
+                    adapter.upsert(
+                        [{"id": i, "level": 1, "vector": vec(3)} for i in order]
+                    )
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+
+        def updater(forward: bool) -> None:
+            order = ids if forward else list(reversed(ids))
+            for _ in range(5):
+                try:
+                    adapter.get_collection().update_data(
+                        [{"id": i, "level": 2} for i in order]
+                    )
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+
+        threads = [
+            threading.Thread(target=(upserter if i % 2 else updater), args=(i % 4 < 2,))
+            for i in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == [], errors
+    finally:
+        adapter.close()
+
+
+def test_update_data_writes_nothing_when_a_key_is_missing(
+    dsn: str, test_schema: str
+) -> None:
+    """An unknown key must not leave the batch's other records written.
+
+    The check ran after the transaction committed, so the good records landed
+    and then the call raised. ``LocalCollection`` validates before writing.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "level": 1, "vector": vec(1)})
+        with pytest.raises(ValueError, match="not found"):
+            adapter.get_collection().update_data(
+                [{"id": "a", "level": 77}, {"id": "ghost", "level": 1}]
+            )
+        assert adapter.get(["a"])[0]["level"] == 1
+    finally:
+        adapter.close()
+
+
+def test_null_array_still_sorts_last(dsn: str, test_schema: str) -> None:
+    """Collating a text array must not turn a NULL column into an empty one.
+
+    ``array(SELECT unnest(NULL))`` is the empty array, so a NULL column stopped
+    sorting last and became indistinguishable from a row holding ``[]``.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "empty", "search_tags": [], "vector": vec(1)},
+                {"id": "a", "search_tags": ["a"], "vector": vec(2)},
+                {"id": "under", "search_tags": ["_x"], "vector": vec(3)},
+            ]
+        )
+        inner = adapter.get_collection()._Collection__collection
+        inner._execute(
+            sql.SQL(
+                "INSERT INTO {}.{} (id, vector, search_tags) "
+                "VALUES (%s, %s::vector, NULL)"
+            ).format(sql.Identifier(inner._db_schema), sql.Identifier(inner._table)),
+            ("nullrow", "[" + ",".join(["0.1"] * DIM) + "]"),
+        )
+        ordered = [
+            r["id"]
+            for r in adapter.query(order_by="search_tags", order_desc=False, limit=10)
+        ]
+        assert ordered[-1] == "nullrow", ordered
+        # And element order is code-point, so "_x" sorts before "a".
+        assert ordered.index("under") < ordered.index("a"), ordered
+    finally:
+        adapter.close()
+
+
+def test_null_group_key_avoids_a_real_value(dsn: str, test_schema: str) -> None:
+    """The NULL sentinel must not merge with a row that literally holds it."""
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "lit", "context_type": NULL_BUCKET, "vector": vec(1)},
+                {"id": "real", "context_type": "x", "vector": vec(2)},
+            ]
+        )
+        inner = adapter.get_collection()._Collection__collection
+        inner._execute(
+            sql.SQL("INSERT INTO {}.{} (id, vector) VALUES (%s, %s::vector)").format(
+                sql.Identifier(inner._db_schema), sql.Identifier(inner._table)
+            ),
+            ("nul", "[" + ",".join(["0.1"] * DIM) + "]"),
+        )
+        agg = inner.aggregate_data(
+            index_name="default", op="count", field="context_type"
+        ).agg
+        assert agg[NULL_BUCKET] == 1, agg
+        assert agg[NULL_BUCKET + "_"] == 1, agg
+        assert sum(agg.values()) == adapter.count()
+    finally:
+        adapter.close()

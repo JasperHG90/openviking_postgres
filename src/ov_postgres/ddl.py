@@ -381,21 +381,29 @@ def scalar_index_statements(
             continue
         index_name = f"{table}__{name}_idx"
         method = sql.SQL("gin") if spec.is_array else sql.SQL("btree")
-        # Range comparisons on text run under COLLATE "C" so they agree with
-        # the reference's code-point ordering; a btree in the database
-        # collation cannot serve them, so the index is built collated too.
-        indexed: sql.Composable = sql.Identifier(name)
-        if spec.is_textual and not spec.is_array:
-            indexed = sql.SQL('{} COLLATE "C"').format(sql.Identifier(name))
         statements.append(
             sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({})").format(
                 sql.Identifier(index_name),
                 sql.Identifier(schema_name),
                 sql.Identifier(table),
                 method,
-                indexed,
+                sql.Identifier(name),
             )
         )
+        # A *second*, collated index for range comparisons, which run under
+        # COLLATE "C" to match the reference's code-point ordering. PostgreSQL
+        # matches an expression index syntactically, so a collated index cannot
+        # serve a bare `col = ANY(...)`; replacing the plain one turned every
+        # equality filter -- by far the commonest shape -- into a seq scan.
+        if spec.is_textual and not spec.is_array:
+            statements.append(
+                sql.SQL('CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} COLLATE "C")').format(
+                    sql.Identifier(f"{table}__{name}_c_idx"),
+                    sql.Identifier(schema_name),
+                    sql.Identifier(table),
+                    sql.Identifier(name),
+                )
+            )
         # Path fields are also queried by prefix; a text_pattern_ops index lets
         # `LIKE 'prefix%'` use an index instead of scanning.
         if spec.is_path:

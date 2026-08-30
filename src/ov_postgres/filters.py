@@ -178,7 +178,7 @@ class FilterCompiler:
             conds = node.get("conds")
             if op in _COND_OPS and conds is not None and not isinstance(conds, list):
                 raise UnsupportedFilterError(f"{op} filter conds must be a list")
-            if op in ("must", "must_not") and node.get("para") not in (None, ""):
+            if op in _COND_OPS and node.get("para") not in (None, ""):
                 raise UnsupportedFilterError(
                     f"Filter parameters are only supported for path fields: {node!r}"
                 )
