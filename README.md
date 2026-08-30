@@ -352,9 +352,9 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 
 ## Every record needs an embedding
 
-`upsert` refuses a record with no vector. OpenViking's own validator marks the
-vector field required, so such a row cannot exist on the built-in backend
-either — and pgvector's HNSW and IVFFlat builds skip NULL vectors, so a row
+`upsert` refuses a *new* record with no vector, and `update_data` refuses to
+clear one. OpenViking's own validator marks the vector field required, so such
+a row cannot exist on the built-in backend either — and pgvector's HNSW and IVFFlat builds skip NULL vectors, so a row
 without one would be counted but never returned by an index scan.
 
 A database written by an earlier version of this package may hold such rows.
@@ -364,6 +364,7 @@ search. `backfill_defaults` repairs missing scalars; it cannot invent an
 embedding. To find them:
 
 ```sql
+-- adjust the schema and table to your `schema` / `table_prefix` settings
 SELECT id FROM openviking.ov_context WHERE vector IS NULL;
 ```
 

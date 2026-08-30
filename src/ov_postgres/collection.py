@@ -19,7 +19,7 @@ from openviking.storage.vectordb.collection.result import (
     UpdateResult,
     UpsertDataResult,
 )
-from psycopg import sql
+from psycopg import Cursor, sql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -118,6 +118,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
     pgvector_version :
         Installed pgvector version, used to gate features. An empty tuple
         disables every gated feature.
+    index_name :
+        Name of the index bundle, used to resolve an ``auto`` index method
+        from the registry.
     owns_pool :
         Whether :meth:`close` should also close the pool. False when the
         adapter owns it and shares it across collections.
@@ -145,6 +148,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         tz_policy: str = "local",
         iterative_scan: str = "relaxed_order",
         pgvector_version: tuple[int, ...] = (),
+        index_name: str = "default",
         owns_pool: bool = False,
     ) -> None:
         super().__init__()
@@ -168,6 +172,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         self._tz_policy = tz_policy
         self._iterative_scan = iterative_scan
         self._pgvector_version = pgvector_version
+        self._index_name = index_name
         self._closed = False
         self._lock = threading.RLock()
         self._compiler = FilterCompiler(
@@ -382,10 +387,6 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             method = "flat" if index_type.startswith("flat") else "hnsw"
         else:
             method = self._index_method
-        # Recorded so `_iterative_scan_setup` sees the resolved method; with
-        # "auto" left in place the GUC was never emitted and an ANN search
-        # silently truncated at hnsw.ef_search.
-        self._index_method = method
 
         statements: list[Statement] = list(
             ddl.scalar_index_statements(self._db_schema, self._table, self._schema)
@@ -607,9 +608,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             logger.warning("pgvector backend ignores ttl=%s (not implemented)", ttl)
 
         self._check_open()
-        columns, rows, ids = self._replacement_rows(data_list)
+        columns, rows, ids, vectorless = self._replacement_rows(data_list)
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                # Checked inside the writing transaction: on its own connection
+                # the check would commit before the insert begins, and a
+                # concurrent DELETE in that window would let a vectorless row
+                # through.
+                if vectorless:
+                    self._reject_new_vectorless(cur, vectorless)
                 cur.executemany(self._upsert_statement(columns), rows)
         return UpsertDataResult(ids=ids)
 
@@ -663,6 +670,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return UpdateResult(ok=True, ids=[], updated_count=0)
 
         pk = self._schema.primary_key.name
+        vector_field = self._schema.vector_field
         updated: list[str] = []
         missing: list[str] = []
         self._check_open()
@@ -671,6 +679,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 for record in data_list:
                     if pk not in record:
                         raise ValueError(f"update_data record is missing {pk!r}")
+                    if (
+                        vector_field is not None
+                        and vector_field.name in record
+                        and record[vector_field.name] is None
+                    ):
+                        # Clearing a vector would leave a row that no ANN index
+                        # can return, which is what the upsert guard prevents.
+                        raise ValueError(
+                            f"update_data cannot clear {vector_field.name!r} on "
+                            f"{record[pk]!r}: an embedding is required"
+                        )
                     columns, values, extra = self._split_record(record)
                     setters = [
                         sql.SQL("{} = {}").format(sql.Identifier(c), sql.Placeholder())
@@ -1157,6 +1176,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             raise ValueError(f"Unknown sort field: {field!r}")
 
         direction = sql.SQL("DESC") if str(order).lower() == "desc" else sql.SQL("ASC")
+        # Same reason as the range comparisons: PostgreSQL's default collation
+        # is not code-point order, so a text sort would disagree with the
+        # built-in backend's Python sort.
+        sort_col: sql.Composable = sql.Identifier(field)
+        if spec.is_textual and not spec.is_array:
+            sort_col = sql.SQL('{} COLLATE "C"').format(sql.Identifier(field))
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
@@ -1170,7 +1195,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             cols=self._select_list(columns, include_extra=include_extra),
             table=self._qualified,
             pred=predicate,
-            sort=sql.Identifier(field),
+            sort=sort_col,
             dir=direction,
         )
         rows = self._execute(statement, [*filter_params, limit, offset], fetch="all")
@@ -1422,7 +1447,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
             return []
 
-        guc = _SCAN_GUC.get(self._index_method)
+        guc = _SCAN_GUC.get(self._resolved_index_method())
         if guc is None:
             return []
         mode = self._iterative_scan
@@ -1431,6 +1456,26 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         return [
             sql.SQL("SET LOCAL {}.iterative_scan = {}").format(guc, sql.Literal(mode))
         ]
+
+    def _resolved_index_method(self) -> str:
+        """Return the index method actually in force for this collection.
+
+        ``auto`` defers to whatever the index bundle requested, and that
+        decision lives in the registry rather than on the instance: a process
+        that merely *opens* an existing collection never runs ``create_index``,
+        so latching the resolution at creation time left every other process
+        seeing ``auto`` and emitting no iterative-scan GUC.
+
+        Returns
+        -------
+        str
+            ``flat``, ``hnsw`` or ``ivfflat``.
+        """
+        if self._index_method != "auto":
+            return self._index_method
+        meta = self.get_index_meta_data(self._index_name) or {}
+        index_type = str((meta.get("VectorIndex") or {}).get("IndexType") or "flat")
+        return "flat" if index_type.lower().startswith("flat") else "hnsw"
 
     def _fulltext_specs(self) -> list[FieldSpec]:
         """Return the schema fields backing keyword search.
@@ -1553,12 +1598,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             if score_key is not None:
                 raw = row.get(score_key)
                 score = float(raw) if isinstance(raw, (int, float)) else 0.0
-                # In a pure dense search a row with no embedding has no
-                # comparable similarity, and is reported below every real score
-                # because OpenViking's retriever re-sorts by `_score` and
-                # applies an absolute threshold -- 0.0 would let it overtake a
-                # genuine match. In a hybrid search its sparse score is real,
-                # so it is reported as computed.
+                # A row with no embedding has no comparable similarity, so it
+                # is reported below every real score: OpenViking's retriever
+                # re-sorts by `_score` and applies an absolute threshold, and
+                # 0.0 would let it overtake a genuine match. Hybrid included --
+                # the dense half of its score is fabricated by the COALESCE.
                 if floor_vectorless and row.get("__ov_has_vector") is False:
                     score = NO_VECTOR_SCORE
             items.append(SearchItemResult(id=identifier, fields=record, score=score))
@@ -1594,7 +1638,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
     def _replacement_rows(
         self, data_list: list[dict[str, Any]]
-    ) -> tuple[list[str], list[list[Any]], list[str]]:
+    ) -> tuple[list[str], list[list[Any]], list[str], list[str]]:
         """Build one uniform row per record for a replacing upsert.
 
         Every row binds the same column list -- every writable schema column
@@ -1610,8 +1654,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         Returns
         -------
-        tuple[list[str], list[list[Any]], list[str]]
-            The column list, one value row per record, and the primary keys.
+        tuple[list[str], list[list[Any]], list[str], list[str]]
+            The column list, one value row per record, the primary keys, and
+            the keys of records that arrived without an embedding.
 
         Raises
         ------
@@ -1656,13 +1701,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             ids.append(str(mapping[pk]))
             rows.append([mapping.get(name) for name in columns])
 
-        if vectorless:
-            self._reject_new_vectorless(vectorless, vector_field)
-        return columns, rows, ids
+        return columns, rows, ids, vectorless
 
-    def _reject_new_vectorless(
-        self, ids: list[str], vector_field: FieldSpec | None
-    ) -> None:
+    def _reject_new_vectorless(self, cur: Cursor[Any], ids: list[str]) -> None:
         """Refuse a *new* record with no embedding, but allow rewriting an old one.
 
         The engine's validator marks the vector Required, and pgvector's index
@@ -1676,27 +1717,28 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         Parameters
         ----------
+        cur :
+            Cursor inside the writing transaction, so the check and the insert
+            cannot be separated by a concurrent delete.
         ids :
             Primary keys of records that arrived without an embedding.
-        vector_field :
-            The collection's vector field.
 
         Raises
         ------
         ValueError
             If any of them names a row that does not already exist.
         """
+        vector_field = self._schema.vector_field
         if vector_field is None:
             return
         pk = sql.Identifier(self._schema.primary_key.name)
-        rows = self._execute(
-            sql.SQL("SELECT {pk} FROM {table} WHERE {pk} = ANY(%s)").format(
+        cur.execute(
+            sql.SQL("SELECT {pk} FROM {table} WHERE {pk} = ANY(%s) FOR UPDATE").format(
                 pk=pk, table=self._qualified
             ),
             (ids,),
-            fetch="all",
         )
-        existing = {str(row[self._schema.primary_key.name]) for row in rows}
+        existing = {str(row[0]) for row in cur.fetchall()}
         new = [i for i in ids if i not in existing]
         if new:
             raise ValueError(

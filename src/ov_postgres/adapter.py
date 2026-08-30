@@ -350,6 +350,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 tz_policy=self._params.tz_policy,
                 iterative_scan=self._params.iterative_scan,
                 pgvector_version=self._pgvector_version,
+                index_name=self._index_name,
                 owns_pool=False,
             )
         )

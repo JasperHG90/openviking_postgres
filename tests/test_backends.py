@@ -21,7 +21,13 @@ from pydantic import ValidationError
 from ov_postgres import ddl
 from ov_postgres.adapter import PgVectorCollectionAdapter
 
-from .test_integration import DIM, META, as_reference_row, vec
+from .test_integration import (
+    DIM,
+    FIELD_TYPES,
+    META,
+    as_reference_row,
+    vec,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -47,6 +53,17 @@ def build(
         index_name="default",
     )
     return adapter
+
+
+def build_existing(dsn: str, schema: str, **params: object) -> PgVectorCollectionAdapter:
+    """Open an already-created collection without calling create_collection."""
+    config = VectorDBBackendConfig(
+        backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+        name="context",
+        index_name="default",
+        custom_params={"dsn": dsn, "schema": schema, **params},
+    )
+    return PgVectorCollectionAdapter.from_config(config)
 
 
 def indexes_on(dsn: str, schema: str, table: str = "ov_context") -> dict[str, str]:
@@ -1293,10 +1310,19 @@ def test_auto_index_method_still_gets_the_scan_guc(dsn: str, test_schema: str) -
     adapter = build(dsn, test_schema, index_method="auto")
     try:
         inner = adapter.get_collection()._Collection__collection
-        assert inner._index_method in ("flat", "hnsw", "ivfflat")
-        assert inner._index_method != "auto"
+        assert inner._resolved_index_method() in ("flat", "hnsw", "ivfflat")
     finally:
         adapter.close()
+
+    # A second process only *opens* the collection and never runs create_index,
+    # so the resolution has to come from the registry rather than instance state.
+    reopened = build_existing(dsn, test_schema, index_method="auto")
+    try:
+        inner = reopened.get_collection()._Collection__collection
+        assert inner._index_method == "auto"
+        assert inner._resolved_index_method() in ("flat", "hnsw", "ivfflat")
+    finally:
+        reopened.close()
 
 
 @pytest.mark.parametrize("bound", [True, False])
@@ -1414,10 +1440,131 @@ def test_hybrid_order_agrees_with_the_reported_score(dsn: str, test_schema: str)
         )
 
         results = adapter.query(
-            query_vector=vec(1), sparse_query_vector={"7": 1.0}, limit=10
+            query_vector=vec(9), sparse_query_vector={"7": 1.0}, limit=10
         )
         assert results[0]["id"] == "real"
         scores = [r["_score"] for r in results]
         assert scores == sorted(scores, reverse=True), results
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "key,bound,expect",
+    [
+        ("lt", "cat", {"slash", "Zed"}),
+        ("gt", "cat", {"zed"}),
+        ("gte", "Zed", {"zed", "Zed"}),
+        ("lt", "a", {"slash", "Zed"}),
+    ],
+)
+def test_string_ranges_use_code_point_order(
+    dsn: str, test_schema: str, key: str, bound: str, expect: set[str]
+) -> None:
+    """Text is compared by code point, as the reference does.
+
+    PostgreSQL orders text by the database collation, which on the usual
+    ``en_US.utf8`` image ignores punctuation and case in a way Python does not:
+    ``'/x/y' < 'c_d'`` is false there and true in Python. Without an explicit C
+    collation this diverged on roughly one filter in a hundred.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        records: list[dict[str, Any]] = [
+            {"id": "slash", "name": "/x/y/z", "vector": vec(1)},
+            {"id": "zed", "name": "zed", "vector": vec(2)},
+            {"id": "Zed", "name": "Zed", "vector": vec(3)},
+        ]
+        adapter.upsert(records)
+        node = {"op": "range", "field": "name", key: bound}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
+
+        # And the reference agrees with that expectation.
+        reference = {
+            r["id"]
+            for r in (as_reference_row(META, rec) for rec in records)
+            if matches_filter(r, node, FIELD_TYPES)
+        }
+        assert reference == expect
+    finally:
+        adapter.close()
+
+
+def test_scalar_sort_uses_code_point_order(dsn: str, test_schema: str) -> None:
+    """``search_by_scalar`` on text must order as a Python sort would."""
+    adapter = build(dsn, test_schema)
+    try:
+        names = ["/x/y/z", "Zed", "_under", "alpha", "zed"]
+        adapter.upsert(
+            [{"id": n, "name": n, "vector": vec(i)} for i, n in enumerate(names)]
+        )
+        ordered = [
+            r["id"] for r in adapter.query(order_by="name", order_desc=False, limit=10)
+        ]
+        assert ordered == sorted(names)
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("key", ["lt", "lte", "gt", "gte"])
+@pytest.mark.parametrize("bound", [float("inf"), float("-inf")])
+def test_infinite_bounds_on_a_text_column_match_nothing(
+    dsn: str, test_schema: str, key: str, bound: float
+) -> None:
+    """Infinity against a string column matches nothing, as the reference does.
+
+    ``"alpha" < inf`` raises TypeError in Python and ``_in_range`` returns
+    False. The saturation shortcut answered before the column type was
+    consulted, so it reported "satisfied by everything" instead.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        records: list[dict[str, Any]] = [{"id": "a", "name": "alpha", "vector": vec(1)}]
+        adapter.upsert(records)
+        node = {"op": "range", "field": "name", key: bound}
+        expected = {
+            r["id"]
+            for r in (as_reference_row(META, rec) for rec in records)
+            if matches_filter(r, node, FIELD_TYPES)
+        }
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expected
+    finally:
+        adapter.close()
+
+
+def test_must_not_on_an_undeclared_field_honours_none(dsn: str, test_schema: str) -> None:
+    """``must_not`` with ``None`` in conds must exclude a row with no such field.
+
+    An absent field reads as ``None``, so ``must`` matches and its negation
+    must not. Only the ``must`` branch handled it.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "vector": vec(1)})
+        assert (
+            adapter.query(
+                filter={"op": "must_not", "field": "nosuch", "conds": [None]}, limit=10
+            )
+            == []
+        )
+        assert (
+            len(
+                adapter.query(
+                    filter={"op": "must", "field": "nosuch", "conds": [None]}, limit=10
+                )
+            )
+            == 1
+        )
+    finally:
+        adapter.close()
+
+
+def test_update_data_cannot_clear_an_embedding(dsn: str, test_schema: str) -> None:
+    """Nulling a vector would recreate the row no ANN index can return."""
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "vector": vec(1)})
+        with pytest.raises(ValueError, match="embedding is required"):
+            adapter.get_collection().update_data([{"id": "a", "vector": None}])
     finally:
         adapter.close()

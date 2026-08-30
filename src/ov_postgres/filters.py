@@ -176,10 +176,14 @@ class FilterCompiler:
             # An undeclared field has no value, so the reference evaluates
             # against None: `must` and `contains` fail, while the negated
             # forms (`must_not`, `range_out`) succeed.
-            if op in ("must_not", "range_out"):
-                return sql.SQL("TRUE")
-            if op == "must" and None in (node.get("conds") or []):
+            names_null = None in (node.get("conds") or [])
+            if op == "must":
                 # `None in conds` matches a missing value.
+                return sql.SQL("TRUE") if names_null else sql.SQL("FALSE")
+            if op == "must_not":
+                # ...and its negation must then exclude the row.
+                return sql.SQL("FALSE") if names_null else sql.SQL("TRUE")
+            if op == "range_out":
                 return sql.SQL("TRUE")
             return sql.SQL("FALSE")
 
@@ -507,6 +511,12 @@ class FilterCompiler:
         # PostgreSQL as `bigint[] >= smallint`. Checking the element type is not
         # enough: list<int64> against an int bound has a compatible element type
         # and still cannot be ordered.
+        #
+        # A *list* bound would be a genuine lexicographic comparison in both
+        # Python and PostgreSQL, so this is stricter than the reference there.
+        # No OpenViking path emits one -- `Range` bounds come from scalars --
+        # and the alternative is threading array comparison through the whole
+        # operand pipeline for a shape nothing produces.
         if spec.is_array and bounded:
             return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
 
@@ -539,10 +549,17 @@ class FilterCompiler:
                 # of the wrong type excludes every row rather than raising.
                 return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
             bound_params.append(self._coerce(spec, value, for_ordering=True))
-            # A boolean column is ordered numerically, as Python orders
-            # True/False against a number, so it is cast rather than the bound
-            # being squeezed into a boolean.
-            ordered = sql.SQL("{}::int").format(col) if spec.ov_type == "bool" else col
+            ordered = col
+            if spec.ov_type == "bool":
+                # Ordered numerically, as Python orders True/False against a
+                # number, rather than the bound being squeezed into a boolean.
+                ordered = sql.SQL("{}::int").format(col)
+            elif spec.is_textual and not spec.is_array:
+                # PostgreSQL orders text by the database collation. On the usual
+                # en_US.utf8 image `'/x/y' < 'c_d'` is false, where Python -- and
+                # so the reference -- says true. The C collation is code-point
+                # order, which is what the reference uses.
+                ordered = sql.SQL('{} COLLATE "C"').format(col)
             parts.append(
                 sql.SQL("{} {} {}").format(ordered, operator, self._scalar_operand(spec))
             )
@@ -745,10 +762,6 @@ def _saturating_bound(spec: FieldSpec, key: str, value: object) -> bool | None:
         return None
     if isinstance(value, float) and math.isnan(value):
         return None
-    if value == math.inf:
-        return key in ("lt", "lte")
-    if value == -math.inf:
-        return key in ("gt", "gte")
     low: int | float
     high: int | float
     if spec.ov_type in ("int64", "list<int64>"):
