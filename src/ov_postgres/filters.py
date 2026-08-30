@@ -33,6 +33,11 @@ from .schema import CollectionSchema, FieldSpec
 
 _DEPTH_RE = re.compile(r"\s*-d=(-?\d+)\s*")
 
+# PostgreSQL's bigint and real bounds. An operand outside them cannot equal any
+# stored value, and binding it raises instead of simply not matching.
+_BIGINT_MIN, _BIGINT_MAX = -(2**63), 2**63 - 1
+_REAL_MAX = 3.4028235e38
+
 # Ops that carry their operand in a "conds" list.
 _COND_OPS = {"must", "must_not", "prefix", "regex"}
 _RANGE_OPS = {"range", "range_out", "time_range"}
@@ -520,7 +525,7 @@ class FilterCompiler:
             value = node.get(key)
             if value is None:
                 continue
-            if not _is_comparable(spec, value):
+            if not _is_comparable(spec, value, for_ordering=True):
                 # `_in_range` catches TypeError and returns False, so a bound
                 # of the wrong type excludes every row rather than raising.
                 return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
@@ -576,7 +581,7 @@ _COMPARABLE_TYPES: dict[str, tuple[type, ...]] = {
 _NO_BOOL_OPERAND = frozenset({"date_time"})
 
 
-def _is_comparable(spec: FieldSpec, value: object) -> bool:
+def _is_comparable(spec: FieldSpec, value: object, *, for_ordering: bool = False) -> bool:
     """Return whether ``value`` can be compared against ``spec``'s column.
 
     Python compares ``True == 1``, so the reference matches a boolean against
@@ -592,6 +597,9 @@ def _is_comparable(spec: FieldSpec, value: object) -> bool:
         The column the value would be compared against.
     value :
         The candidate operand.
+    for_ordering :
+        True for a range bound, where a boolean column is compared by order
+        rather than equality and so accepts any number.
 
     Returns
     -------
@@ -601,17 +609,30 @@ def _is_comparable(spec: FieldSpec, value: object) -> bool:
     allowed = _COMPARABLE_TYPES.get(spec.ov_type)
     if allowed is None:
         return False
-    if isinstance(value, float) and not math.isfinite(value):
-        # PostgreSQL orders NaN above every number and treats infinity as a
-        # real bound; the reference matches neither. Excluding them here keeps
-        # `lte=NaN` from selecting the whole table.
+    if isinstance(value, int) and not isinstance(value, bool):
+        if spec.ov_type in ("int64", "list<int64>") and not (
+            _BIGINT_MIN <= value <= _BIGINT_MAX
+        ):
+            # Out of bigint range: no stored value can equal it, and binding it
+            # raises NumericValueOutOfRange rather than matching nothing.
+            return False
+        if spec.ov_type == "float32" and abs(value) > _REAL_MAX:
+            return False
+    if isinstance(value, float) and math.isnan(value):
+        # PostgreSQL sorts NaN above every number, so `lte=NaN` selected the
+        # whole table while the reference matched none of it. Infinity is a
+        # different case and stays: Python orders against it exactly as
+        # PostgreSQL does, so `lte=inf` legitimately matches everything.
         return False
     if spec.ov_type == "bool":
-        # bool(2) would be True, but the reference says `True == 2` is False,
-        # so only 0 and 1 convert -- from int or from an integral float.
         if isinstance(value, bool):
             return True
-        return isinstance(value, (int, float)) and value in (0, 1)
+        if not isinstance(value, (int, float)):
+            return False
+        # Equality needs an exact 0 or 1 -- the reference says `True == 2` is
+        # False -- but ordering does not: `True >= 0.5` is True, so a range
+        # bound anywhere on the number line is meaningful.
+        return for_ordering or value in (0, 1)
     if isinstance(value, bool):
         if spec.ov_type in _NO_BOOL_OPERAND:
             return False

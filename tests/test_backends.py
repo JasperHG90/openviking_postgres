@@ -785,14 +785,11 @@ def test_mixed_and_fractional_numeric_operands(
         adapter.close()
 
 
-@pytest.mark.parametrize("bound", [float("nan"), float("inf")])
 @pytest.mark.parametrize("key", ["lte", "lt", "gte", "gt"])
-def test_non_finite_range_bounds_match_nothing(
-    dsn: str, test_schema: str, bound: float, key: str
-) -> None:
+def test_nan_range_bounds_match_nothing(dsn: str, test_schema: str, key: str) -> None:
     """A NaN bound must not select the whole table.
 
-    PostgreSQL sorts NaN above every number, so ``level <= NaN`` was true for
+    PostgreSQL sorts NaN above every number, so ``score <= NaN`` was true for
     every row, while the reference's ``_in_range`` matches none of them.
     """
     adapter = build_geo(dsn, test_schema)
@@ -803,8 +800,41 @@ def test_non_finite_range_bounds_match_nothing(
                 {"id": "b", "score": 5.0, "vector": vec(2)},
             ]
         )
-        node = {"op": "range", "field": "score", key: bound}
+        node = {"op": "range", "field": "score", key: float("nan")}
         assert adapter.query(filter=node, limit=10) == []
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "key,bound,expect",
+    [
+        ("lte", float("inf"), {"a", "b"}),
+        ("lt", float("inf"), {"a", "b"}),
+        ("gte", float("-inf"), {"a", "b"}),
+        ("gt", float("-inf"), {"a", "b"}),
+        ("gte", float("inf"), set()),
+        ("lte", float("-inf"), set()),
+    ],
+)
+def test_infinite_range_bounds_order_normally(
+    dsn: str, test_schema: str, key: str, bound: float, expect: set[str]
+) -> None:
+    """Infinity is a real bound and must not be dropped.
+
+    Python orders against infinity exactly as PostgreSQL does, so ``lte=inf``
+    matches everything. Rejecting it alongside NaN made these match nothing.
+    """
+    adapter = build_geo(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "a", "score": 1.0, "vector": vec(1)},
+                {"id": "b", "score": 5.0, "vector": vec(2)},
+            ]
+        )
+        node = {"op": "range", "field": "score", key: bound}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
     finally:
         adapter.close()
 
@@ -851,5 +881,219 @@ def test_empty_datetime_round_trips_from_the_local_backend(
     try:
         adapter.upsert({"id": "a", "created_at": "", "vector": vec(1)})
         assert "created_at" not in adapter.get(["a"])[0]
+    finally:
+        adapter.close()
+
+
+def test_ann_index_is_actually_used(dsn: str, test_schema: str) -> None:
+    """The emitted statement must be planned as an index scan, not a seq scan.
+
+    Anything wrapped around the distance operator -- the score template, a
+    COALESCE, an extra leading ORDER BY key -- stops PostgreSQL matching the
+    expression against the HNSW operator class, and it silently falls back to
+    scanning every row. That made ``index_method`` and the whole iterative-scan
+    mechanism inert while the README advertised them.
+    """
+    import random
+
+    import psycopg
+
+    adapter = build(dsn, test_schema, index_method="hnsw")
+    try:
+        rng = random.Random(7)
+        adapter.upsert(
+            [
+                {
+                    "id": f"r{i}",
+                    "level": i % 3,
+                    "vector": [rng.uniform(-1, 1) for _ in range(DIM)],
+                }
+                for i in range(2000)
+            ]
+        )
+
+        captured: dict[str, Any] = {}
+        collection = adapter.get_collection()._Collection__collection
+        original = collection._execute
+
+        def spy(stmt: Any, params: Any = None, **kw: Any) -> Any:
+            text = stmt.as_string(None) if hasattr(stmt, "as_string") else str(stmt)
+            if "_score" in text and text.lstrip().startswith("SELECT"):
+                captured["sql"] = text
+                captured["params"] = list(params or [])
+            return original(stmt, params, **kw)
+
+        collection._execute = spy
+        adapter.query(query_vector=vec(1), limit=10)
+        collection._execute = original
+
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'ANALYZE "{test_schema}".ov_context')
+            cur.execute("EXPLAIN " + captured["sql"], captured["params"])
+            plan = "\n".join(row[0] for row in cur.fetchall())
+
+        assert "Index Scan" in plan, plan
+        assert "hnsw" in plan.lower(), plan
+        assert "Seq Scan" not in plan, plan
+    finally:
+        adapter.close()
+
+
+def test_sparse_vector_takes_no_default(dsn: str, test_schema: str) -> None:
+    """``sparse_vector`` must stay unset, as the engine leaves it.
+
+    ``LocalCollection._write_data_list`` pops the sparse-vector key before
+    serialising, so defaulting it to ``{}`` here inverted every filter that
+    tests it for absence.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "vector": vec(1)})
+        assert "sparse_vector" not in adapter.get(["a"])[0]
+        node = {"op": "must", "field": "sparse_vector", "conds": [None]}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == {"a"}
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "declared,expected",
+    [
+        (5, 5),
+        (0, 0),
+        ("n/a", 0),
+    ],
+)
+def test_declared_default_is_validated(
+    dsn: str, test_schema: str, declared: object, expected: object
+) -> None:
+    """A mistyped ``DefaultValue`` falls back to the type default.
+
+    The engine never validates ``DefaultValue`` -- pydantic skips defaults --
+    so a string on an integer column is accepted there. Writing it verbatim
+    here would make every upsert fail on the column type.
+    """
+    meta = {
+        "CollectionName": "context",
+        "Fields": [
+            {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+            {"FieldName": "level", "FieldType": "int64", "DefaultValue": declared},
+            {"FieldName": "vector", "FieldType": "vector", "Dim": DIM},
+        ],
+        "ScalarIndex": ["level"],
+    }
+    config = VectorDBBackendConfig(
+        backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+        name="context",
+        index_name="default",
+        custom_params={"dsn": dsn, "schema": test_schema},
+    )
+    adapter = PgVectorCollectionAdapter.from_config(config)
+    adapter.create_collection(
+        "context", meta, distance="cosine", sparse_weight=0.0, index_name="default"
+    )
+    try:
+        adapter.upsert({"id": "a", "vector": vec(1)})
+        assert adapter.get(["a"])[0]["level"] == expected
+    finally:
+        adapter.close()
+
+
+def test_declared_default_does_not_stop_backfill_converging(
+    dsn: str, test_schema: str
+) -> None:
+    """A timestamp default must not make the backfill rewrite rows forever.
+
+    ``DefaultValue: ""`` on a ``date_time`` resolved to NULL, so the column
+    joined the repair predicate with a no-op assignment and every row was
+    rewritten on every pass.
+    """
+    meta = {
+        "CollectionName": "context",
+        "Fields": [
+            {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+            {"FieldName": "when", "FieldType": "date_time", "DefaultValue": ""},
+            {"FieldName": "level", "FieldType": "int64"},
+            {"FieldName": "vector", "FieldType": "vector", "Dim": DIM},
+        ],
+        "ScalarIndex": ["level"],
+    }
+    config = VectorDBBackendConfig(
+        backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+        name="context",
+        index_name="default",
+        custom_params={"dsn": dsn, "schema": test_schema},
+    )
+    adapter = PgVectorCollectionAdapter.from_config(config)
+    adapter.create_collection(
+        "context", meta, distance="cosine", sparse_weight=0.0, index_name="default"
+    )
+    try:
+        adapter.upsert([{"id": f"r{i}", "vector": vec(i)} for i in range(3)])
+        assert adapter.backfill_defaults() == 0
+        assert adapter.backfill_defaults() == 0
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "key,bound,expect",
+    [
+        ("lte", 2, {"t", "f"}),
+        ("gte", 0.5, {"t"}),
+        ("lt", 0.5, {"f"}),
+    ],
+)
+def test_range_bounds_on_a_bool_column(
+    dsn: str, test_schema: str, key: str, bound: object, expect: set[str]
+) -> None:
+    """A boolean column is orderable, so a range bound need not be 0 or 1.
+
+    Equality needs an exact 0 or 1 -- the reference finds ``True == 2`` false --
+    but ``True >= 0.5`` is true, so ordering accepts any number.
+    """
+    adapter = build_geo(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "t", "flag": True, "vector": vec(1)},
+                {"id": "f", "flag": False, "vector": vec(2)},
+            ]
+        )
+        node = {"op": "range", "field": "flag", key: bound}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "field,conds", [("counts", [10**19]), ("score", [10**400]), ("level", [10**19])]
+)
+def test_out_of_range_operands_match_nothing(
+    dsn: str, test_schema: str, field: str, conds: list[Any]
+) -> None:
+    """An operand no column value could equal must not crash the query.
+
+    ``10**19`` exceeds bigint and raised ``NumericValueOutOfRange``; the
+    reference simply matches nothing.
+    """
+    adapter = build_geo(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "counts": [1], "score": 1.0, "vector": vec(1)})
+        node = {"op": "must", "field": field, "conds": conds}
+        assert adapter.query(filter=node, limit=10) == []
+    finally:
+        adapter.close()
+
+
+def test_fractional_value_is_refused_by_an_int_column(dsn: str, test_schema: str) -> None:
+    """Writing 1.7 to an integer column must not silently store 2.
+
+    The engine's validator raises ``int_from_float`` rather than rounding.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        with pytest.raises(ValueError, match="not an integer"):
+            adapter.upsert({"id": "a", "level": 1.7, "vector": vec(1)})
     finally:
         adapter.close()

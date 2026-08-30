@@ -386,14 +386,50 @@ def default_for(spec: FieldSpec) -> object:
     """
     if spec.is_primary or spec.is_vector:
         return None
-    if spec.declared_default is not None:
-        # The engine reads DefaultValue before falling back to TYPE_DEFAULTS.
-        return spec.declared_default
     # `convert_fields_dict_for_index` drops date_time and geo_point when their
     # value is empty, and `LocalCollection._write_data_list` pops the vector and
     # sparse-vector keys outright, so the engine index never holds a default for
     # any of them.
     if spec.ov_type in ("date_time", "geo_point", "sparse_vector"):
         return None
+    # The declared default is checked only after the exclusions, and only when
+    # its type fits the column. Applying it first let a DefaultValue of ""
+    # reinstate a NULL timestamp on every backfill pass, and a DefaultValue of
+    # the wrong type reach a typed column and fail every write.
+    declared = spec.declared_default
+    if declared is not None and _fits(spec, declared):
+        return declared
     value = TYPE_DEFAULTS.get(spec.ov_type)
     return list(value) if isinstance(value, list) else value
+
+
+def _fits(spec: FieldSpec, value: object) -> bool:
+    """Return whether a declared default is storable in the column.
+
+    The engine does not validate ``DefaultValue`` -- pydantic skips defaults --
+    so a mistyped one is silently accepted there and would fail every write
+    here. Ignoring it and using the type default keeps the collection usable.
+
+    Parameters
+    ----------
+    spec :
+        The declared field.
+    value :
+        The schema's ``DefaultValue``.
+
+    Returns
+    -------
+    bool
+        True when the value matches the column's type.
+    """
+    if spec.ov_type in ("string", "text", "path"):
+        return isinstance(value, str)
+    if spec.ov_type == "bool":
+        return isinstance(value, bool)
+    if spec.ov_type == "int64":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if spec.ov_type == "float32":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if spec.ov_type in ("list<string>", "list<int64>"):
+        return isinstance(value, list)
+    return False

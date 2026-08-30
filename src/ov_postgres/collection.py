@@ -55,13 +55,12 @@ _DISTANCE: dict[str, tuple[sql.SQL, sql.SQL]] = {
 
 DEFAULT_KEYWORD_FIELDS = ("name", "description", "abstract", "tags", "search_tags")
 
-# Rows carrying a dense vector sort ahead of rows without one, as a separate
-# ordering key rather than a sentinel folded into the score. A sentinel cannot
-# work: any value small enough to sit below every real score (l2 distances
-# overflow to infinity, `ip` reaches 2e38) also swamps the sparse term, so
-# `sentinel + sparse == sentinel` and sparse-only rows stop being ordered
-# against each other.
-_HAS_VECTOR_FIRST = sql.SQL("({} IS NOT NULL) DESC")
+# Reported score for a row with no embedding. This is a *display* floor, not a
+# ranking sentinel: ordering never uses it, so it cannot swamp a sparse term.
+# OpenViking's HierarchicalRetriever re-sorts candidates by `_score` in Python
+# and applies an absolute threshold, so a vectorless row reporting 0.0 would
+# overtake a genuine but distant match and pass a threshold of zero.
+NO_VECTOR_SCORE = -1e30
 
 # GUC namespaces for iterative scan, as SQL literals so nothing derived from
 # configuration is spliced into a statement as raw text.
@@ -722,7 +721,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         )
         return True
 
-    def backfill_defaults(self) -> int:
+    def backfill_defaults(self, *, batch_size: int = 5000) -> int:
         """Set the engine default on every column left NULL by an older write.
 
         Defaults are applied on write, so rows stored before this backend began
@@ -733,7 +732,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         Safe to repeat: it only touches columns that are NULL, and never the
         primary key, vectors, timestamps or geo points -- the fields the engine
-        itself leaves unset.
+        itself leaves unset. Safe alongside a concurrent writer: each row is
+        locked and re-checked, so a value written meanwhile is preserved.
+
+        Work is committed in batches so a large table does not hold row locks
+        for the whole run, produce one enormous WAL burst, or lose all progress
+        on interruption.
+
+        Parameters
+        ----------
+        batch_size :
+            Rows to repair per transaction.
 
         Returns
         -------
@@ -760,14 +769,28 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if not assignments:
             return 0
 
-        statement = sql.SQL("UPDATE {} SET {} WHERE {}").format(
-            self._qualified,
-            sql.SQL(", ").join(assignments),
-            sql.SQL(" OR ").join(predicates),
+        pk = sql.Identifier(self._schema.primary_key.name)
+        needs_repair = sql.SQL("({})").format(sql.SQL(" OR ").join(predicates))
+        statement = sql.SQL(
+            "UPDATE {table} SET {sets} WHERE {pk} IN ("
+            "  SELECT {pk} FROM {table} WHERE {needs} LIMIT {limit}"
+            ")"
+        ).format(
+            table=self._qualified,
+            sets=sql.SQL(", ").join(assignments),
+            pk=pk,
+            needs=needs_repair,
+            limit=sql.Literal(int(batch_size)),
         )
-        with self._pool.connection() as conn, conn.cursor() as cur:
-            cur.execute(statement, params)
-            return int(cur.rowcount)
+
+        total = 0
+        while True:
+            with self._pool.connection() as conn, conn.cursor() as cur:
+                cur.execute(statement, params)
+                repaired = int(cur.rowcount)
+            total += repaired
+            if repaired < batch_size:
+                return total
 
     def delete_all_data(self) -> bool:
         """Remove every row, leaving the table and its indexes in place.
@@ -872,34 +895,43 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # from `delete(filter=...)`, `scroll` and `fetch_by_uri` -- while
         # `count()` still counted them. That left a record written without an
         # embedding both unfindable and undeletable.
-        # Two ordering keys, not one: a row with no embedding has no comparable
-        # similarity, so it is ranked behind every row that has one, and only
-        # then by whatever score it does have (its sparse contribution, if any).
-        vector_field = self._schema.vector_field
-        leading: Statement = sql.SQL("")
-        if dense_vector is not None and vector_field is not None:
-            leading = sql.SQL("{}, ").format(
-                _HAS_VECTOR_FIRST.format(sql.Identifier(vector_field.name))
-            )
+        # Order by the bare distance operator whenever it can decide the
+        # ranking on its own. Anything wrapped around it -- the score template,
+        # a COALESCE, an extra leading key -- makes the expression unmatchable
+        # against the HNSW/IVFFlat operator class, and PostgreSQL falls back to
+        # a sequential scan plus a top-N sort. That silently made index_method
+        # and the whole iterative-scan mechanism inert.
+        #
+        # ASC on a distance is also NULLS LAST by default, so a row without an
+        # embedding lands behind every row that has one for free.
+        order_expr, order_params = self._order_expression(dense_vector, sparse_vector)
 
         statement = sql.SQL(
-            "SELECT {cols}, {score} AS _score FROM {table} WHERE {pred} "
-            "ORDER BY {leading}_score DESC NULLS LAST LIMIT %s OFFSET %s"
+            "SELECT {cols}, {score} AS _score, {vec_present} AS _has_vector "
+            "FROM {table} WHERE {pred} ORDER BY {order} LIMIT %s OFFSET %s"
         ).format(
-            leading=leading,
             cols=self._select_list(columns, include_extra=include_extra),
             score=score_expr,
+            vec_present=self._has_vector_expression(),
             table=self._qualified,
             pred=predicate,
+            order=order_expr,
         )
-        params = [*score_params, *filter_params, limit, offset]
+        # Placeholder order follows the statement: SELECT, then WHERE, then
+        # ORDER BY.
+        params = [*score_params, *filter_params, *order_params, limit, offset]
         rows = self._execute(
             statement,
             params,
             fetch="all",
             setup=self._iterative_scan_setup(filtered=bool(filters)),
         )
-        return self._rows_to_search_result(rows, columns)
+        hybrid = bool(
+            sparse_vector and self._schema.sparse_field and self._sparse_weight > 0
+        )
+        return self._rows_to_search_result(
+            rows, columns, floor_vectorless=dense_vector is not None and not hybrid
+        )
 
     def search_by_id(
         self,
@@ -1228,6 +1260,64 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         }
         return AggregateResult(agg=agg, op=op, field=field)
 
+    def _has_vector_expression(self) -> Statement:
+        """Project whether the row carries a dense vector.
+
+        Reported separately from the score so ordering and reporting can use
+        different expressions; folding the distinction into the score is what
+        broke ranking in both directions previously.
+
+        Returns
+        -------
+        Statement
+            A boolean expression, constant TRUE when the schema has no vector.
+        """
+        vector_field = self._schema.vector_field
+        if vector_field is None:
+            return sql.SQL("TRUE")
+        return sql.SQL("({} IS NOT NULL)").format(sql.Identifier(vector_field.name))
+
+    def _order_expression(
+        self,
+        dense_vector: list[float] | None,
+        sparse_vector: dict[str, float] | None,
+    ) -> tuple[Statement, list[Any]]:
+        """Build the ORDER BY, preferring a form an ANN index can serve.
+
+        A pure dense search orders by the bare ``vector <op> query`` distance,
+        which is exactly what the HNSW and IVFFlat operator classes match, so
+        the planner can use the index. Hybrid search cannot: the sparse term is
+        not in any index, so it falls back to ordering by the combined score.
+
+        Parameters
+        ----------
+        dense_vector :
+            The dense query vector, if any.
+        sparse_vector :
+            The sparse query vector, if any.
+
+        Returns
+        -------
+        tuple[Statement, list[Any]]
+            The ORDER BY expression and the parameters it binds.
+        """
+        vector_field = self._schema.vector_field
+        hybrid = bool(
+            sparse_vector and self._schema.sparse_field and self._sparse_weight > 0
+        )
+        if dense_vector is not None and vector_field is not None and not hybrid:
+            operator, _ = _DISTANCE[self._distance]
+            return (
+                sql.SQL("{} {} {}::vector ASC").format(
+                    sql.Identifier(vector_field.name), operator, sql.Placeholder()
+                ),
+                [_format_vector(dense_vector)],
+            )
+        # Hybrid, or no dense vector at all: rank by the combined score. Rows
+        # without an embedding contribute 0 from the dense term and sort behind
+        # anything with a real similarity by virtue of the score itself.
+        return sql.SQL("_score DESC NULLS LAST"), []
+
     def _score_expression(
         self,
         dense_vector: list[float] | None,
@@ -1431,6 +1521,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         rows: Sequence[Mapping[str, Any]] | None,
         columns: list[str],
         score_key: str | None = "_score",
+        *,
+        floor_vectorless: bool = False,
     ) -> SearchResult:
         """Wrap result rows in a SearchResult."""
         pk = self._schema.primary_key.name
@@ -1442,6 +1534,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             if score_key is not None:
                 raw = row.get(score_key)
                 score = float(raw) if isinstance(raw, (int, float)) else 0.0
+                # In a pure dense search a row with no embedding has no
+                # comparable similarity, and is reported below every real score
+                # because OpenViking's retriever re-sorts by `_score` and
+                # applies an absolute threshold -- 0.0 would let it overtake a
+                # genuine match. In a hybrid search its sparse score is real,
+                # so it is reported as computed.
+                if floor_vectorless and row.get("_has_vector") is False:
+                    score = NO_VECTOR_SCORE
             items.append(SearchItemResult(id=identifier, fields=record, score=score))
         return SearchResult(data=items)
 
@@ -1557,6 +1657,19 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 raise ValueError(
                     f"{spec.ov_type} field {spec.name!r} cannot store {value!r}: "
                     "NaN and infinity have no consistent ordering"
+                )
+            # Checked after the non-finite guard, since NaN is not integral
+            # either and deserves the clearer message.
+            if (
+                spec.ov_type == "int64"
+                and isinstance(value, float)
+                and not value.is_integer()
+            ):
+                # The engine's validator raises int_from_float here; rounding
+                # silently would store a value the caller never sent.
+                raise ValueError(
+                    f"int64 field {spec.name!r} cannot store {value!r}: "
+                    "a fractional value is not an integer"
                 )
         if spec.is_datetime:
             # The engine's own default for a timestamp is "", and it drops the

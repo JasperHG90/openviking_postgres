@@ -370,6 +370,27 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         result = self.get_collection().update_data(data_list)
         return list(getattr(result, "ids", None) or [])
 
+    def backfill_defaults(self, *, batch_size: int = 5000) -> int:
+        """Repair rows written before per-type defaults were applied.
+
+        Exposed here because OpenViking's ``Collection`` facade forwards only
+        the ``ICollection`` interface, so the underlying method is otherwise
+        reachable only through a name-mangled attribute.
+
+        Parameters
+        ----------
+        batch_size :
+            Rows to repair per transaction.
+
+        Returns
+        -------
+        int
+            Number of rows updated.
+        """
+        collection = self.get_collection()
+        inner: PgVectorCollection = collection._Collection__collection
+        return inner.backfill_defaults(batch_size=batch_size)
+
     def close(self) -> None:
         """Release the collection handle and close the connection pool."""
         super().close()

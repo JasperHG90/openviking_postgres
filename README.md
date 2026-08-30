@@ -365,13 +365,14 @@ from openviking_cli.utils.config import get_openviking_config
 from openviking.storage.vectordb_adapters.factory import create_collection_adapter
 
 adapter = create_collection_adapter(get_openviking_config().storage.vectordb)
-collection = adapter.get_collection()
-print(collection.backfill_defaults(), "rows repaired")
+print(adapter.backfill_defaults(), "rows repaired")
 adapter.close()
 ```
 
 It only touches columns that are NULL, never the primary key, vectors,
-timestamps or geo points, and is safe to run more than once.
+timestamps or geo points, and is safe to run more than once. Work is committed
+in batches (`batch_size=5000` by default), so a large table does not hold row
+locks for the whole run, and a concurrent writer's value is preserved.
 
 ## Troubleshooting
 
