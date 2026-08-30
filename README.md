@@ -14,7 +14,7 @@ OpenViking ships five vector backends — `local`, `cuvs`, `http`, `volcengine`,
 - **Every field becomes a real typed column**, so filters compile to ordinary SQL over ordinary indexes — and you can inspect your agent's memory with `psql`.
 - **Exact search by default.** Switch to HNSW or IVFFlat when volume demands it, with version-gated iterative scan so a selective filter never silently returns a short page.
 - **Lexical keyword search** over your text columns, via PostgreSQL full-text search — no embedding model needed.
-- **Filter behaviour is checked against OpenViking's own evaluator** by 1,089 differential cases in the integration suite, so a filter behaves the same here as on the built-in backend.
+- **Filter behaviour is checked against OpenViking's own evaluator** by 1,665 differential cases in the integration suite, covering every filterable field type, so a filter behaves the same here as on the built-in backend.
 - **Runs on managed PostgreSQL** where your role cannot `CREATE EXTENSION`.
 
 ## Quick start
@@ -393,7 +393,9 @@ uv run pytest -m integration
 
 Point it at a server you already have with `OV_POSTGRES_TEST_DSN` instead. Each test runs in a throwaway schema that is dropped afterwards.
 
-The suite's centrepiece is `test_filter_semantics_match_reference` — part of the **integration** suite, so `uv run pytest` alone does not exercise it. It generates random records and **1,089 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. That is what pins this backend to native behaviour rather than to an interpretation of it.
+The suite's centrepiece is `test_filter_semantics_match_reference` — part of the **integration** suite, so `uv run pytest` alone does not exercise it. Across two schemas it generates random records and **1,665 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. That is what pins this backend to native behaviour rather than to an interpretation of it.
+
+Between them the two schemas cover every filterable field type: `string`, `text`, `path`, `int64`, `float32`, `bool`, `list<string>` and `list<int64>`. The three that are absent cannot be compared -- the reference evaluator refuses `date_time` and `geo_point` outright, and `sparse_vector` is not filterable.
 
 ## Contributing
 

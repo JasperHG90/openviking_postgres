@@ -759,3 +759,124 @@ def test_search_projection_still_excludes_vectors(
     hit = adapter.query(query_vector=vec(1), limit=1)[0]
     assert "vector" not in hit
     assert "sparse_vector" not in hit
+
+
+WIDE_META: dict[str, Any] = {
+    "CollectionName": "context",
+    "Description": "collection covering the field types the context schema omits",
+    "Fields": [
+        {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+        {"FieldName": "flag", "FieldType": "bool"},
+        {"FieldName": "score", "FieldType": "float32"},
+        {"FieldName": "counts", "FieldType": "list<int64>"},
+        {"FieldName": "body", "FieldType": "text"},
+        {"FieldName": "vector", "FieldType": "vector", "Dim": DIM},
+    ],
+    "ScalarIndex": ["flag", "score", "counts", "body"],
+}
+
+WIDE_FIELD_TYPES = {f["FieldName"]: f["FieldType"] for f in WIDE_META["Fields"]}
+
+
+@pytest.fixture
+def wide_adapter(dsn: str, test_schema: str) -> Iterator[PgVectorCollectionAdapter]:
+    """Yield an adapter over a collection declaring the less common types."""
+    inst = make_adapter(dsn, test_schema)
+    inst.create_collection(
+        "context", WIDE_META, distance="cosine", sparse_weight=0.0, index_name="default"
+    )
+    try:
+        yield inst
+    finally:
+        inst.close()
+
+
+def _wide_record(rng: random.Random, index: int) -> dict[str, Any]:
+    """Build one pseudo-random record over bool, float32, list<int64> and text."""
+    record: dict[str, Any] = {
+        "id": f"w{index}",
+        "flag": rng.choice([True, False]),
+        "score": rng.choice([0.1, 0.5, 1.0, 2.5, 9.75]),
+        "counts": rng.sample([1, 2, 3, 5, 8], k=rng.randint(0, 3)),
+        "body": rng.choice(["alpha text", "beta text", "gamma", "50%_x"]),
+        "vector": vec(index),
+    }
+    for field in ("flag", "score", "counts", "body"):
+        if rng.random() < 0.2:
+            del record[field]
+    return record
+
+
+def _wide_candidate_filters() -> list[dict[str, Any]]:
+    """Return leaf filters over the wide schema, plus pairwise combinations."""
+    leaves: list[dict[str, Any]] = [
+        {"op": "must", "field": "flag", "conds": [True]},
+        {"op": "must", "field": "flag", "conds": [False]},
+        {"op": "must_not", "field": "flag", "conds": [True]},
+        {"op": "must", "field": "score", "conds": [0.1]},
+        {"op": "must", "field": "score", "conds": [0.1, 9.75]},
+        {"op": "must_not", "field": "score", "conds": [0.5]},
+        {"op": "range", "field": "score", "gte": 0.5},
+        {"op": "range", "field": "score", "gt": 0.1, "lte": 2.5},
+        {"op": "range_out", "field": "score", "gte": 0.5, "lt": 2.5},
+        {"op": "must", "field": "counts", "conds": [3]},
+        {"op": "must", "field": "counts", "conds": [1, 8]},
+        {"op": "must_not", "field": "counts", "conds": [2]},
+        {"op": "must", "field": "body", "conds": ["gamma"]},
+        {"op": "must_not", "field": "body", "conds": ["gamma"]},
+        {"op": "contains", "field": "body", "substring": "text"},
+        {"op": "contains", "field": "body", "substring": "50%_x"},
+        {"op": "range", "field": "counts", "gte": 2},
+        {"op": "must", "field": "flag", "conds": [None]},
+        {"op": "must", "field": "score", "conds": [None]},
+        {"op": "must", "field": "flag", "conds": ["not-a-bool"]},
+        {"op": "must", "field": "score", "conds": ["not-a-number"]},
+        {"op": "must", "field": "counts", "conds": ["not-an-int"]},
+        {"op": "contains", "field": "score", "substring": "0"},
+        {"op": "must", "field": "body", "conds": [7]},
+    ]
+    combos: list[dict[str, Any]] = list(leaves)
+    for left, right in itertools.combinations(leaves, 2):
+        combos.append({"op": "and", "conds": [left, right]})
+        combos.append({"op": "or", "conds": [left, right]})
+    return combos
+
+
+def test_filter_semantics_match_reference_for_remaining_types(
+    wide_adapter: PgVectorCollectionAdapter,
+) -> None:
+    """Extend the differential comparison to bool, float32, list<int64> and text.
+
+    The main sweep runs against the ``context`` schema, which declares only
+    ``string``, ``path``, ``int64`` and ``list<string>``. The casts this
+    backend applies for the other types -- ``::real[]`` for float32,
+    ``::bigint[]`` for list<int64> -- and the deliberate bool/int64 exclusion in
+    ``_is_comparable`` were previously asserted only against hand-written
+    expectations. This checks them against the reference evaluator instead.
+    """
+    rng = random.Random(20260830)
+    records = [_wide_record(rng, i) for i in range(60)]
+    wide_adapter.upsert(records)
+
+    checked = 0
+    skipped: list[dict[str, Any]] = []
+    for node in _wide_candidate_filters():
+        try:
+            expected = {
+                row["id"]
+                for row in records
+                if matches_filter(row, node, WIDE_FIELD_TYPES)
+            }
+        except UnsupportedCuVSFilterError:
+            skipped.append(node)
+            continue
+
+        actual = {r["id"] for r in wide_adapter.query(filter=node, limit=1000)}
+        assert actual == expected, (
+            f"filter {node!r}\n  sql-only: {sorted(actual - expected)}"
+            f"\n  py-only:  {sorted(expected - actual)}"
+        )
+        checked += 1
+
+    assert checked > 400, f"expected a broad sweep, only compared {checked} filters"
+    assert not skipped, f"{len(skipped)} filters were never compared: {skipped[:3]}"

@@ -481,6 +481,16 @@ class FilterCompiler:
     ) -> sql.Composable:
         """Compile a bounded comparison, negating for ``range_out``."""
         col = _col(spec.name)
+
+        # An array column has no ordering against a scalar bound. The reference
+        # evaluates `list >= 2`, catches the TypeError and returns False, so the
+        # filter must match nothing rather than reach PostgreSQL as
+        # `bigint[] >= smallint`. Checking the element type is not enough:
+        # list<int64> against an int bound has a compatible element type and
+        # still cannot be compared.
+        if spec.is_array:
+            return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
+
         comparisons = (
             ("gt", sql.SQL(">")),
             ("gte", sql.SQL(">=")),
