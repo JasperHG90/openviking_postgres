@@ -24,7 +24,7 @@ You need a PostgreSQL 13+ database with [pgvector](https://github.com/pgvector/p
 Install into the environment that runs OpenViking:
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/ov-postgres@v0.1.0"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@v0.1.0"
 ```
 
 Here is a complete `~/.openviking/ov.conf` that runs on Postgres. Copy it whole, change the DSN, and you are done:
@@ -97,20 +97,20 @@ Install it into the **same environment that runs OpenViking**. The server import
 From a tagged release:
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/ov-postgres@v0.1.0"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@v0.1.0"
 ```
 
 Or from a wheel attached to a GitHub Release:
 
 ```bash
-uv add https://github.com/JasperHG90/ov-postgres/releases/download/v0.1.0/ov_postgres-0.1.0-py3-none-any.whl
+uv add https://github.com/JasperHG90/openviking_postgres/releases/download/v0.1.0/ov_postgres-0.1.0-py3-none-any.whl
 ```
 
 If OpenViking runs from a virtualenv you manage by hand rather than a `uv` project:
 
 ```bash
 uv pip install --python /path/to/openviking/.venv/bin/python \
-  "ov-postgres @ git+https://github.com/JasperHG90/ov-postgres@v0.1.0"
+  "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@v0.1.0"
 ```
 
 Confirm it landed where OpenViking will find it:
@@ -122,7 +122,7 @@ Confirm it landed where OpenViking will find it:
 ### Working on the package itself
 
 ```bash
-git clone https://github.com/JasperHG90/ov-postgres
+git clone https://github.com/JasperHG90/openviking_postgres
 cd ov-postgres
 uv sync
 ```
