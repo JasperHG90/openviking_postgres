@@ -2046,3 +2046,70 @@ def test_null_group_key_avoids_a_real_value(dsn: str, test_schema: str) -> None:
         assert sum(agg.values()) == adapter.count()
     finally:
         adapter.close()
+
+
+LONG_FIELD = "a_very_long_field_name_that_users_might_plausibly_declare"
+
+LONG_META: dict[str, Any] = {
+    "CollectionName": "context",
+    "Fields": [
+        {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+        {"FieldName": LONG_FIELD, "FieldType": "string"},
+        {"FieldName": "vector", "FieldType": "vector", "Dim": DIM},
+    ],
+    "ScalarIndex": [LONG_FIELD],
+}
+
+
+def test_long_field_names_get_distinct_indexes(dsn: str, test_schema: str) -> None:
+    """Index names must stay distinct after PostgreSQL truncates them.
+
+    Identifiers are silently cut at 63 bytes, so ``…_idx`` and ``…_c_idx`` for
+    a long field collapsed to the same name. ``CREATE INDEX IF NOT EXISTS``
+    matches by name, so the collated index was skipped without complaint and
+    every text range on that column scanned the table.
+    """
+    config = VectorDBBackendConfig(
+        backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+        name="context",
+        index_name="default",
+        custom_params={"dsn": dsn, "schema": test_schema},
+    )
+    adapter = PgVectorCollectionAdapter.from_config(config)
+    adapter.create_collection(
+        "context", LONG_META, distance="cosine", sparse_weight=0.0, index_name="default"
+    )
+    try:
+        built = indexes_on(dsn, test_schema)
+        on_long_field = [
+            name for name, definition in built.items() if LONG_FIELD in definition
+        ]
+        # Both the plain and the collated index must exist as separate objects.
+        assert len(on_long_field) == 2, built
+        assert len(set(on_long_field)) == 2
+        assert all(len(name.encode("utf-8")) <= 63 for name in on_long_field)
+
+        collated = [d for d in built.values() if 'COLLATE "C"' in d]
+        assert collated, built
+
+        adapter.upsert({"id": "a", LONG_FIELD: "value", "vector": vec(1)})
+        node = {"op": "must", "field": LONG_FIELD, "conds": ["value"]}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == {"a"}
+    finally:
+        adapter.close()
+
+
+def test_short_index_names_are_unchanged(dsn: str, test_schema: str) -> None:
+    """A name that already fits must not be rewritten.
+
+    Existing databases keep the index names they have, so the collision-safe
+    naming must be a no-op below the limit.
+    """
+    assert ddl.index_name("ov_context", "name", "idx") == "ov_context__name_idx"
+    assert ddl.index_name("ov_context", "fts_idx") == "ov_context__fts_idx"
+
+    adapter = build(dsn, test_schema)
+    try:
+        assert "ov_context__name_idx" in indexes_on(dsn, test_schema)
+    finally:
+        adapter.close()

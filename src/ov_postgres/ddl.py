@@ -17,6 +17,9 @@ Statement = sql.SQL | sql.Composed
 REGISTRY_COLLECTIONS = "ov_collections"
 REGISTRY_INDEXES = "ov_indexes"
 
+# PostgreSQL truncates identifiers at this many bytes, silently.
+_MAX_IDENTIFIER_BYTES = 63
+
 
 # Minimum pgvector versions for features that are not always available.
 # https://github.com/pgvector/pgvector -- HNSW arrived in 0.5.0, and the
@@ -131,6 +134,40 @@ def bootstrap_statements(
             """
         ).format(ns, sql.Identifier(REGISTRY_INDEXES)),
     ]
+
+
+def index_name(table: str, *parts: str) -> str:
+    """Build an index name that stays distinct after PostgreSQL truncates it.
+
+    PostgreSQL silently truncates an identifier at 63 bytes, so
+    ``ov_ctx__<long field>_idx`` and ``ov_ctx__<long field>_c_idx`` collapse to
+    the same name. ``CREATE INDEX IF NOT EXISTS`` then matches by name and
+    skips the second index without complaint -- leaving, for instance, no
+    collated index and every text range scanning the table.
+
+    Names that already fit are returned unchanged, so existing databases keep
+    the index names they have.
+
+    Parameters
+    ----------
+    table :
+        Table the index is on.
+    parts :
+        Name components, joined with underscores after the table.
+
+    Returns
+    -------
+    str
+        An index name of at most 63 bytes, distinct for distinct inputs.
+    """
+    candidate = f"{table}__{'_'.join(parts)}"
+    if len(candidate.encode("utf-8")) <= _MAX_IDENTIFIER_BYTES:
+        return candidate
+    digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:8]
+    suffix = f"_{digest}"
+    keep = _MAX_IDENTIFIER_BYTES - len(suffix)
+    trimmed = candidate.encode("utf-8")[:keep].decode("utf-8", "ignore")
+    return f"{trimmed}{suffix}"
 
 
 def _path_matches_fn(schema_name: str) -> Statement:
@@ -379,11 +416,11 @@ def scalar_index_statements(
         spec = coll.by_name(name)
         if spec is None or spec.is_vector or spec.is_sparse or spec.is_geo:
             continue
-        index_name = f"{table}__{name}_idx"
+        plain_name = index_name(table, name, "idx")
         method = sql.SQL("gin") if spec.is_array else sql.SQL("btree")
         statements.append(
             sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({})").format(
-                sql.Identifier(index_name),
+                sql.Identifier(plain_name),
                 sql.Identifier(schema_name),
                 sql.Identifier(table),
                 method,
@@ -398,7 +435,7 @@ def scalar_index_statements(
         if spec.is_textual and not spec.is_array:
             statements.append(
                 sql.SQL('CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} COLLATE "C")').format(
-                    sql.Identifier(f"{table}__{name}_c_idx"),
+                    sql.Identifier(index_name(table, name, "c_idx")),
                     sql.Identifier(schema_name),
                     sql.Identifier(table),
                     sql.Identifier(name),
@@ -411,7 +448,7 @@ def scalar_index_statements(
                 sql.SQL(
                     "CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} text_pattern_ops)"
                 ).format(
-                    sql.Identifier(f"{table}__{name}_prefix_idx"),
+                    sql.Identifier(index_name(table, name, "prefix_idx")),
                     sql.Identifier(schema_name),
                     sql.Identifier(table),
                     sql.Identifier(name),
@@ -490,7 +527,7 @@ def vector_index_statement(
         )
 
     statement = sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({} {})").format(
-        sql.Identifier(f"{table}__{spec.name}_{method}_idx"),
+        sql.Identifier(index_name(table, spec.name, method, "idx")),
         sql.Identifier(schema_name),
         sql.Identifier(table),
         ann_method,
@@ -530,7 +567,7 @@ def fulltext_index_statement(
     if not specs:
         return None
     return sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING gin ({})").format(
-        sql.Identifier(f"{table}__fts_idx"),
+        sql.Identifier(index_name(table, "fts_idx")),
         sql.Identifier(schema_name),
         sql.Identifier(table),
         tsvector_expr(specs, regconfig, schema_name),
