@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import threading
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, overload
@@ -442,6 +443,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         with self._lock:
             self._distance = distance
+            # The resolver reads pg_indexes; this call just changed them.
+            self._resolved_method = None
         return _IndexHandle(index_name, meta_data)
 
     def has_index(self, index_name: str) -> bool:
@@ -713,6 +716,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # every writer must take row locks in one order or two batches
                 # touching the same rows deadlock. Upsert sorting alone was not
                 # enough -- it made previously-safe mixed workloads deadlock.
+                # Sorted for lock ordering only; `updated` is re-ordered to
+                # match the caller's input below, as upsert_data does.
                 for record in sorted(data_list, key=lambda r: str(r.get(pk))):
                     if pk not in record:
                         raise ValueError(f"update_data record is missing {pk!r}")
@@ -757,7 +762,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                         missing.append(str(record[pk]))
         if missing:
             raise ValueError(f"record not found for primary key(s): {', '.join(missing)}")
-        return UpdateResult(ok=True, ids=updated, updated_count=len(updated))
+        # Records are written in sorted order for lock safety, but the caller
+        # is told which keys landed in the order they supplied them -- as
+        # upsert_data and LocalCollection both do.
+        written = set(updated)
+        ordered = [key for key in keys if key in written]
+        return UpdateResult(ok=True, ids=ordered, updated_count=len(ordered))
 
     def delete_data(self, primary_keys: list[Any]) -> bool:
         """Delete rows by primary key.
@@ -1074,15 +1084,23 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         tsvector = ddl.tsvector_expr(specs, self._text_search_config, self._db_schema)
         # websearch_to_tsquery accepts free-form user input without throwing on
         # punctuation, unlike to_tsquery.
-        # plainto_tsquery, not websearch_to_tsquery: the latter honours `-`,
-        # `OR` and quotes as operators, so `-fox` returned the complement of
-        # what the caller asked for. Quoting each term instead made every
-        # multi-word search a phrase search. plainto_tsquery ANDs the terms and
-        # treats punctuation as text, which is the literal matching wanted.
-        tsquery = sql.SQL("plainto_tsquery({}::regconfig, %s)").format(
-            sql.Literal(self._text_search_config)
+        # One plainto_tsquery per term, OR'd together.
+        #
+        # plainto_tsquery rather than websearch_to_tsquery: the latter honours
+        # `-`, `OR` and quotes as operators, so `-fox` returned the complement
+        # of what was asked for. Quoting each term instead turned every
+        # multi-word query into a phrase query. But a single plainto over all
+        # terms joined ANDs them, so `keywords=["fox", "dog"]` stopped matching
+        # either one. Per-term queries keep both properties: words inside a
+        # term are ANDed, separate terms are alternatives.
+        per_term = sql.SQL(" || ").join(
+            sql.SQL("plainto_tsquery({}::regconfig, %s)").format(
+                sql.Literal(self._text_search_config)
+            )
+            for _ in terms
         )
-        query_text = " ".join(terms)
+        tsquery = sql.SQL("({})").format(per_term)
+        pass  # query text is built per term below
 
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
@@ -1099,8 +1117,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             table=self._qualified,
             pred=predicate,
         )
-        # Placeholder order: rank's tsquery, filter params, WHERE's tsquery.
-        params = [query_text, *filter_params, query_text, limit, offset]
+        # Placeholder order: rank's tsquery terms, filter params, then the
+        # WHERE clause's copy of the same terms.
+        params = [*terms, *filter_params, *terms, limit, offset]
         rows = self._execute(statement, params, fetch="all")
         return self._rows_to_search_result(rows, columns)
 
@@ -1593,35 +1612,30 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         return resolved
 
     def ensure_indexes(self) -> list[str]:
-        """Create any index this version expects but the database lacks.
+        """Bring the collection's indexes in line with what this version expects.
 
         ``CollectionAdapter.create_collection`` returns early when the
         collection already exists, so ``create_index`` never runs again and a
-        database created by an earlier version keeps whatever indexes it had.
-        This brings it up to date; every statement is ``IF NOT EXISTS``, so it
-        is safe to run repeatedly.
+        database created by an earlier version keeps the indexes it had.
+
+        Creating them is not enough on its own. An earlier version built the
+        *collated* index under the plain index's name, so the name is already
+        taken and ``CREATE INDEX IF NOT EXISTS`` silently skips the plain one --
+        reporting success while leaving equality, the commonest filter, with no
+        usable index. Any index whose stored definition differs from the one
+        this version would create is therefore dropped and rebuilt.
+
+        Each statement commits on its own so the table is locked for one index
+        at a time rather than for the whole run; ``CREATE INDEX`` still blocks
+        writers for the duration of each.
 
         Returns
         -------
         list[str]
-            Names of indexes that were missing before this ran.
+            Names of indexes that were created or rebuilt.
         """
         self._check_open()
-        before = {
-            str(row["indexname"])
-            for row in self._execute(
-                sql.SQL(
-                    "SELECT indexname FROM pg_indexes "
-                    "WHERE schemaname = %s AND tablename = %s"
-                ),
-                (self._db_schema, self._table),
-                fetch="all",
-            )
-            or []
-        }
-        statements = ddl.scalar_index_statements(
-            self._db_schema, self._table, self._schema
-        )
+        wanted = ddl.scalar_index_statements(self._db_schema, self._table, self._schema)
         fts = ddl.fulltext_index_statement(
             self._db_schema,
             self._table,
@@ -1629,20 +1643,57 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             self._text_search_config,
         )
         if fts is not None:
-            statements.append(fts)
+            wanted.append(fts)
 
-        with self._pool.connection() as conn, conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
-            cur.execute(
+        existing = {
+            str(row["indexname"]): str(row["indexdef"])
+            for row in self._execute(
                 sql.SQL(
-                    "SELECT indexname FROM pg_indexes "
+                    "SELECT indexname, indexdef FROM pg_indexes "
                     "WHERE schemaname = %s AND tablename = %s"
                 ),
                 (self._db_schema, self._table),
+                fetch="all",
             )
-            after = {str(row[0]) for row in cur.fetchall()}
-        return sorted(after - before)
+            or []
+        }
+
+        # Only the scalar indexes are reconciled. Their key is a bare column,
+        # optionally collated, so comparing definitions is reliable -- and that
+        # is exactly where the damage is, a collated index wearing the plain
+        # one's name. A full-text key is an expression PostgreSQL rewrites
+        # heavily (COALESCE casing, ::text casts, added parentheses), so it can
+        # never be matched textually and any attempt would rebuild it forever.
+        reconcilable = {
+            _index_name_of(st.as_string(None))
+            for st in ddl.scalar_index_statements(
+                self._db_schema, self._table, self._schema
+            )
+        }
+
+        changed: list[str] = []
+        for statement in wanted:
+            rendered = statement.as_string(None)
+            name = _index_name_of(rendered)
+            if name is None:
+                continue
+            current = existing.get(name)
+            if current is not None and (
+                name not in reconcilable or _definitions_agree(current, rendered)
+            ):
+                continue
+            with self._pool.connection() as conn, conn.cursor() as cur:
+                if current is not None:
+                    # Wrong definition under the right name: the only way to
+                    # correct it, since IF NOT EXISTS matches on name alone.
+                    cur.execute(
+                        sql.SQL("DROP INDEX {}.{}").format(
+                            sql.Identifier(self._db_schema), sql.Identifier(name)
+                        )
+                    )
+                cur.execute(statement)
+            changed.append(name)
+        return sorted(changed)
 
     def _fulltext_specs(self) -> list[FieldSpec]:
         """Return the schema fields backing keyword search.
@@ -1831,6 +1882,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             If a record omits the primary key.
         """
         pk = self._schema.primary_key.name
+        pk_is_text = self._schema.primary_key.ov_type in ("string", "text", "path")
         vector_field = self._schema.vector_field
         columns: list[str] = []
         for spec in self._schema.fields:
@@ -1863,6 +1915,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             mapping["extra"] = json.dumps(extra) if extra else "{}"
             if mapping.get(pk) is None:
                 raise ValueError(f"upsert record is missing primary key {pk!r}")
+            if pk_is_text:
+                # PostgreSQL writes 3 into a text column happily, but every
+                # read path then binds it as an integer and raises
+                # `operator does not exist: text = smallint` -- a row that can
+                # be written and never read, updated or deleted.
+                mapping[pk] = str(mapping[pk])
             if vector_field is not None and mapping.get(vector_field.name) is None:
                 vectorless.append(str(mapping[pk]))
             ids.append(str(mapping[pk]))
@@ -2027,6 +2085,79 @@ class _IndexHandle:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         """Return a debugging representation naming the index."""
         return f"<PgVectorIndex {self.name!r}>"
+
+
+_INDEX_NAME_RE = re.compile(r'CREATE INDEX(?: IF NOT EXISTS)? "([^"]+)"')
+
+
+def _index_name_of(statement: str) -> str | None:
+    """Extract the index name from a rendered CREATE INDEX statement.
+
+    Parameters
+    ----------
+    statement :
+        A rendered ``CREATE INDEX`` statement.
+
+    Returns
+    -------
+    str | None
+        The index name, or ``None`` if the statement is not a CREATE INDEX.
+    """
+    match = _INDEX_NAME_RE.search(statement)
+    return match.group(1) if match else None
+
+
+def _definitions_agree(stored: str, wanted: str) -> bool:
+    """Compare an existing index definition with the one we would create.
+
+    ``pg_indexes.indexdef`` is PostgreSQL's own normalised rendering, so it
+    never matches our SQL textually. Comparing the parenthesised key, with
+    whitespace and quoting stripped, is enough to tell a plain index from a
+    collated one -- the distinction that matters here.
+
+    Only sound for a simple column key. PostgreSQL rewrites an expression key
+    (function casing, added casts and parentheses) far enough that no textual
+    comparison survives, so callers must not use this on one.
+
+    Parameters
+    ----------
+    stored :
+        ``indexdef`` as PostgreSQL reports it.
+    wanted :
+        The statement this version would run.
+
+    Returns
+    -------
+    bool
+        True when the two describe the same index key.
+    """
+
+    def key(text: str) -> str:
+        # The *outermost* parenthesised group after USING: a full-text index
+        # key contains nested calls, so taking the last open paren would
+        # compare only the innermost fragment and never match.
+        start = text.find("(", text.find(" USING ") if " USING " in text else 0)
+        if start == -1:
+            return ""
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    inner = text[start + 1 : i]
+                    return (
+                        "".join(inner.split()).replace('"', "").replace("'", "").lower()
+                    )
+        return ""
+
+    stored_key, wanted_key = key(stored), key(wanted)
+    if stored_key == wanted_key:
+        return True
+    # PostgreSQL renders a regconfig literal with an explicit cast that our SQL
+    # does not carry; ignore that difference rather than rebuild every run.
+    return stored_key.replace("::regconfig", "") == wanted_key.replace("::regconfig", "")
 
 
 def _format_vector(value: object) -> str:

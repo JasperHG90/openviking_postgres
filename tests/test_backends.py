@@ -1881,7 +1881,8 @@ def test_an_upgraded_database_recovers_index_behaviour(
             cur.execute(f'ANALYZE "{test_schema}".ov_context')
         assert len(reopened.query(query_vector=vec(1), limit=200)) == 200
 
-        assert sorted(reopened.ensure_indexes()) == sorted(legacy)
+        repaired = reopened.ensure_indexes()
+        assert set(legacy) <= set(repaired), (repaired, legacy)
         assert reopened.ensure_indexes() == []
     finally:
         reopened.close()
@@ -2111,5 +2112,175 @@ def test_short_index_names_are_unchanged(dsn: str, test_schema: str) -> None:
     adapter = build(dsn, test_schema)
     try:
         assert "ov_context__name_idx" in indexes_on(dsn, test_schema)
+    finally:
+        adapter.close()
+
+
+def test_ensure_indexes_rebuilds_a_wrong_definition(dsn: str, test_schema: str) -> None:
+    """An index with the right name but the wrong definition must be rebuilt.
+
+    An earlier version built the *collated* index under the plain index's name.
+    ``CREATE INDEX IF NOT EXISTS`` matches on name alone, so the migration
+    skipped the plain index and reported success while leaving equality -- the
+    commonest filter -- with no usable index.
+    """
+    import random
+
+    import psycopg
+
+    adapter = build(dsn, test_schema)
+    try:
+        rng = random.Random(41)
+        adapter.upsert(
+            [
+                {
+                    "id": f"r{i}",
+                    "name": f"nm{i:07d}",
+                    "vector": [rng.uniform(-1, 1) for _ in range(DIM)],
+                }
+                for i in range(4000)
+            ]
+        )
+
+        # Recreate the old shape: a collated index wearing the plain one's name.
+        with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("DROP INDEX {}.{}").format(
+                    sql.Identifier(test_schema),
+                    sql.Identifier("ov_context__name_idx"),
+                )
+            )
+            cur.execute(
+                sql.SQL('CREATE INDEX {} ON {}.{} (name COLLATE "C")').format(
+                    sql.Identifier("ov_context__name_idx"),
+                    sql.Identifier(test_schema),
+                    sql.Identifier("ov_context"),
+                )
+            )
+
+        assert "ov_context__name_idx" in adapter.ensure_indexes()
+
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'ANALYZE "{test_schema}".ov_context')
+            cur.execute(
+                f'EXPLAIN SELECT id FROM "{test_schema}".ov_context '
+                "WHERE name = ANY(ARRAY['nm0000777'])"
+            )
+            plan = "\n".join(row[0] for row in cur.fetchall())
+        assert "Index" in plan, plan
+        assert "Seq Scan" not in plan, plan
+        assert adapter.ensure_indexes() == []
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "kwargs,expect",
+    [
+        ({"keywords": ["fox", "dog"]}, {"d1", "d2"}),
+        ({"keywords": ["fox"]}, {"d1"}),
+        ({"query": "quick fox"}, {"d1"}),
+        ({"query": "-fox"}, {"d1"}),
+        ({"keywords": ["fox"], "query": "dog"}, {"d1", "d2"}),
+    ],
+)
+def test_multiple_keywords_are_alternatives(
+    dsn: str, test_schema: str, kwargs: dict[str, Any], expect: set[str]
+) -> None:
+    """Separate keywords are alternatives; words inside one term are required.
+
+    A single ``plainto_tsquery`` over all terms joined ANDs them, so asking for
+    two keywords matched only documents containing both.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "d1", "name": "the quick brown fox", "vector": vec(1)},
+                {"id": "d2", "name": "a lazy dog", "vector": vec(2)},
+                {"id": "d3", "name": "unrelated text", "vector": vec(3)},
+            ]
+        )
+        assert {r["id"] for r in adapter.search_by_keywords(**kwargs)} == expect
+    finally:
+        adapter.close()
+
+
+def test_create_index_invalidates_the_resolved_method(dsn: str, test_schema: str) -> None:
+    """Building an index must not leave a stale cached resolution.
+
+    The resolver caches what ``pg_indexes`` held at first use; ``create_index``
+    changes exactly that, so a search before it kept answering ``flat`` and the
+    scan GUC was never emitted -- truncating results at 40 rows.
+    """
+    adapter = build(dsn, test_schema, index_method="auto")
+    try:
+        inner = adapter.get_collection()._Collection__collection
+        assert inner._resolved_index_method() == "flat"
+
+        inner.create_index(
+            "default",
+            {
+                "IndexName": "default",
+                "VectorIndex": {"IndexType": "hnsw", "Distance": "cosine"},
+                "ScalarIndex": [],
+            },
+        )
+        assert inner._resolved_index_method() == "hnsw"
+        assert len(inner._iterative_scan_setup()) == 1
+    finally:
+        adapter.close()
+
+
+def test_an_integer_primary_key_round_trips(dsn: str, test_schema: str) -> None:
+    """A record written with a non-string key must still be readable.
+
+    PostgreSQL accepts ``3`` for a text column, but every read path binds the
+    key as an integer and raises ``operator does not exist: text = smallint``.
+    The row could be written and then never read, updated or deleted.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": 3, "level": 1, "vector": vec(1)})
+        assert [r["id"] for r in adapter.get(["3"])] == ["3"]
+        adapter.get_collection().update_data([{"id": "3", "level": 2}])
+        assert adapter.get(["3"])[0]["level"] == 2
+        assert adapter.delete(ids=["3"]) == 1
+        assert adapter.count() == 0
+    finally:
+        adapter.close()
+
+
+def test_update_data_returns_ids_in_input_order(dsn: str, test_schema: str) -> None:
+    """The caller is told which keys were written, in the order they gave.
+
+    Sorting for lock ordering must not leak into the return value;
+    ``upsert_data`` and ``LocalCollection`` both preserve input order.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in ("c", "a", "b")])
+        result = adapter.get_collection().update_data(
+            [{"id": "c", "level": 1}, {"id": "a", "level": 1}, {"id": "b", "level": 1}]
+        )
+        assert result.ids == ["c", "a", "b"]
+        assert result.updated_count == 3
+    finally:
+        adapter.close()
+
+
+def test_ensure_indexes_is_idempotent_with_full_text(dsn: str, test_schema: str) -> None:
+    """A full-text index must not be rebuilt on every run.
+
+    Its key is an expression PostgreSQL rewrites heavily, so it can never match
+    our SQL textually. Reconciliation is restricted to simple column indexes;
+    attempting it on an expression would rebuild forever.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "name": "text", "vector": vec(1)})
+        assert adapter.ensure_indexes() == []
+        assert adapter.ensure_indexes() == []
+        assert "ov_context__fts_idx" in indexes_on(dsn, test_schema)
     finally:
         adapter.close()

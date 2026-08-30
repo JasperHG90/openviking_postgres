@@ -376,38 +376,45 @@ Re-index those URIs through OpenViking to give them embeddings, or delete them.
 
 ## Upgrading an existing database
 
-Two repairs apply after upgrading this package. Both are idempotent.
-
-OpenViking skips index creation for a collection that already exists, so a
-database written by an earlier version keeps whatever indexes it had — which
-can leave approximate search silently returning fewer rows than requested, and
-text range filters scanning the whole table:
-
-```python
-print(adapter.ensure_indexes(), "indexes added")
-```
-
-Then repair rows stored before per-type defaults were applied:
-
-Omitted fields are stored with the engine's own defaults — an absent `level` is
-`0`, an absent `name` is `""` — so a filter behaves the same here as on the
-built-in backend. Rows written by an earlier version of this package kept NULL
-instead, so a database that predates it holds two populations and `level == 0`
-finds only the newer rows.
+Two repairs apply after upgrading this package. Both are idempotent, and both
+run from the same adapter:
 
 ```python
 from openviking_cli.utils.config import get_openviking_config
 from openviking.storage.vectordb_adapters.factory import create_collection_adapter
 
 adapter = create_collection_adapter(get_openviking_config().storage.vectordb)
+
+# 1. Indexes. OpenViking skips index creation for a collection that already
+#    exists, so a database written by an earlier version keeps the indexes it
+#    had -- which can leave text filters scanning the whole table. Any index
+#    whose definition no longer matches is rebuilt.
+print(adapter.ensure_indexes(), "indexes created or rebuilt")
+
+# 2. Scalars. Defaults are applied on write, so rows stored before that keep
+#    NULL and a filter such as `level == 0` finds only the newer ones.
 print(adapter.backfill_defaults(), "rows repaired")
+
 adapter.close()
 ```
 
-It only touches columns that are NULL, never the primary key, vectors,
-timestamps or geo points, and is safe to run more than once. Work is committed
-in batches (`batch_size=5000` by default), so a large table does not hold row
-locks for the whole run, and a concurrent writer's value is preserved.
+`ensure_indexes` takes a write lock on the table for the duration of each
+index it builds, so run it during a quiet period on a large collection. It
+does not create vector indexes; those belong to `create_index`.
+
+`backfill_defaults` commits in batches (`batch_size=5000` by default), touches
+only columns that are NULL, and preserves a concurrent writer's value.
+
+Rows written before an embedding was required stay readable and rewritable but
+remain invisible to approximate search, since pgvector's index builds skip NULL
+vectors. Find them with:
+
+```sql
+-- adjust the schema and table to your `schema` / `table_prefix` settings
+SELECT id FROM openviking.ov_context WHERE vector IS NULL;
+```
+
+Re-index those URIs through OpenViking to give them embeddings, or delete them.
 
 ## Troubleshooting
 
