@@ -98,3 +98,17 @@ repo_alias = "4290899e4697f267"
 source_path = "skills/documentation/readme-creator"
 target_dir = ".claude/skills/readme-creator"
 risk_acknowledged = false
+
+[[skill]]
+qualified_name = "4290899e4697f267/generate-art"
+repo_alias = "4290899e4697f267"
+source_path = "skills/tools/generate-art"
+target_dir = ".claude/skills/generate-art"
+risk_acknowledged = false
+
+[[skill]]
+qualified_name = "4290899e4697f267/terminal-gif"
+repo_alias = "4290899e4697f267"
+source_path = "skills/documentation/terminal-gif"
+target_dir = ".claude/skills/terminal-gif"
+risk_acknowledged = false

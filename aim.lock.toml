@@ -19,6 +19,32 @@ risk_acknowledged = false
 sha = "1d92f60fed5599f0f04bbcfe72733b0aa60be7c8"
 installed_at = "2026-08-29T19:58:00.623468Z"
 
+[[skill]]
+qualified_name = "4290899e4697f267/generate-art"
+repo_alias = "4290899e4697f267"
+source_path = "skills/tools/generate-art"
+target_dir = ".claude/skills/generate-art"
+history = []
+content_hash = "832c53b5164ae39bf7c0329e263f2fb55a00141f21774a90084e695e4954f73f"
+risk_acknowledged = false
+
+[skill.current]
+sha = "516c105a9d8260c80a9d1fd8cb4004fe22a74225"
+installed_at = "2026-08-30T07:04:12.078842Z"
+
+[[skill]]
+qualified_name = "4290899e4697f267/terminal-gif"
+repo_alias = "4290899e4697f267"
+source_path = "skills/documentation/terminal-gif"
+target_dir = ".claude/skills/terminal-gif"
+history = []
+content_hash = "599a57b4fa4629c81fd9d53b3f7c6617b230fab04cd9dde33d318bb0c1756711"
+risk_acknowledged = false
+
+[skill.current]
+sha = "516c105a9d8260c80a9d1fd8cb4004fe22a74225"
+installed_at = "2026-08-30T07:04:20.980424Z"
+
 [[rule]]
 qualified_name = "4290899e4697f267/async-python"
 repo_alias = "4290899e4697f267"
