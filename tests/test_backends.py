@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import psycopg
 import pytest
+from openviking.storage.vectordb.index.cuvs_index import matches_filter
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 from psycopg import sql
 from pydantic import ValidationError
@@ -20,7 +21,7 @@ from pydantic import ValidationError
 from ov_postgres import ddl
 from ov_postgres.adapter import PgVectorCollectionAdapter
 
-from .test_integration import DIM, META, vec
+from .test_integration import DIM, META, as_reference_row, vec
 
 pytestmark = pytest.mark.integration
 
@@ -409,6 +410,8 @@ def test_table_prefix_is_honoured(dsn: str, test_schema: str) -> None:
         adapter.close()
 
 
+GEO_FIELD_TYPES: dict[str, str] = {}
+
 GEO_META: dict[str, Any] = {
     "CollectionName": "context",
     "Description": "geo and float test collection",
@@ -423,6 +426,8 @@ GEO_META: dict[str, Any] = {
     ],
     "ScalarIndex": ["name", "score", "counts", "flag"],
 }
+
+GEO_FIELD_TYPES.update({f["FieldName"]: f["FieldType"] for f in GEO_META["Fields"]})
 
 
 def build_geo(dsn: str, schema: str) -> PgVectorCollectionAdapter:
@@ -679,17 +684,17 @@ def test_detected_version_gates_iterative_scan(dsn: str, test_schema: str) -> No
         inner = collection._Collection__collection
         assert inner._pgvector_version >= ddl.MIN_VERSION_ITERATIVE_SCAN
 
-        filtered = inner._iterative_scan_setup(filtered=True)
+        filtered = inner._iterative_scan_setup()
         assert len(filtered) == 1
         assert "hnsw.iterative_scan" in filtered[0].as_string(None)
 
         # Needed for an unfiltered search too: an index scan visits at most
         # hnsw.ef_search candidates, so a bare LIMIT 200 returned 40 rows.
-        assert len(inner._iterative_scan_setup(filtered=False)) == 1
+        assert len(inner._iterative_scan_setup()) == 1
 
         # An older pgvector must not be sent a GUC it does not know.
         inner._pgvector_version = (0, 7, 0)
-        assert inner._iterative_scan_setup(filtered=True) == []
+        assert inner._iterative_scan_setup() == []
     finally:
         adapter.close()
 
@@ -699,7 +704,7 @@ def test_iterative_scan_not_used_for_exact_search(dsn: str, test_schema: str) ->
     adapter = build(dsn, test_schema, index_method="flat")
     try:
         inner = adapter.get_collection()._Collection__collection
-        assert inner._iterative_scan_setup(filtered=True) == []
+        assert inner._iterative_scan_setup() == []
     finally:
         adapter.close()
 
@@ -709,7 +714,7 @@ def test_iterative_scan_off_disables_the_guc(dsn: str, test_schema: str) -> None
     adapter = build(dsn, test_schema, index_method="hnsw", iterative_scan="off")
     try:
         inner = adapter.get_collection()._Collection__collection
-        assert inner._iterative_scan_setup(filtered=True) == []
+        assert inner._iterative_scan_setup() == []
     finally:
         adapter.close()
 
@@ -725,7 +730,7 @@ def test_ivfflat_degrades_strict_order(dsn: str, test_schema: str) -> None:
     )
     try:
         inner = adapter.get_collection()._Collection__collection
-        rendered = inner._iterative_scan_setup(filtered=True)[0].as_string(None)
+        rendered = inner._iterative_scan_setup()[0].as_string(None)
         assert "ivfflat.iterative_scan" in rendered
         assert "relaxed_order" in rendered
     finally:
@@ -1111,6 +1116,8 @@ def test_ann_search_returns_the_full_page(dsn: str, test_schema: str, limit: int
     """
     import random
 
+    import psycopg
+
     adapter = build(dsn, test_schema, index_method="hnsw")
     try:
         rng = random.Random(11)
@@ -1120,6 +1127,12 @@ def test_ann_search_returns_the_full_page(dsn: str, test_schema: str, limit: int
                 for i in range(1500)
             ]
         )
+        # Without statistics the planner picks a sequential scan, which honours
+        # any LIMIT and hides the truncation entirely. Autovacuum would analyse
+        # the table in production, so the test must too or it proves nothing.
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'ANALYZE "{test_schema}".ov_context')
+
         assert len(adapter.query(query_vector=vec(1), limit=limit)) == limit
     finally:
         adapter.close()
@@ -1266,5 +1279,145 @@ def test_backfill_repairs_every_row_whatever_the_batch_size(
 
         node = {"op": "must", "field": "level", "conds": [0]}
         assert len(adapter.query(filter=node, limit=50)) == 7
+    finally:
+        adapter.close()
+
+
+def test_auto_index_method_still_gets_the_scan_guc(dsn: str, test_schema: str) -> None:
+    """``index_method="auto"`` must not lose the iterative-scan GUC.
+
+    ``create_index`` resolved ``auto`` to a concrete method locally, so the
+    gate still saw the literal string and emitted nothing -- leaving the same
+    40-row truncation the GUC exists to prevent.
+    """
+    adapter = build(dsn, test_schema, index_method="auto")
+    try:
+        inner = adapter.get_collection()._Collection__collection
+        assert inner._index_method in ("flat", "hnsw", "ivfflat")
+        assert inner._index_method != "auto"
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("bound", [True, False])
+@pytest.mark.parametrize("key", ["gt", "gte", "lt", "lte"])
+def test_boolean_bounds_on_a_bool_range(
+    dsn: str, test_schema: str, key: str, bound: bool
+) -> None:
+    """A boolean bound must survive the numeric ordering cast.
+
+    Casting the column to int while leaving the bound a PostgreSQL boolean
+    made every one of these raise ``integer >= boolean``.
+    """
+    adapter = build_geo(dsn, test_schema)
+    try:
+        records: list[dict[str, Any]] = [
+            {"id": "t", "flag": True, "vector": vec(1)},
+            {"id": "f", "flag": False, "vector": vec(2)},
+        ]
+        adapter.upsert(records)
+        node = {"op": "range", "field": "flag", key: bound}
+        expected = {
+            r["id"]
+            for r in (as_reference_row(GEO_META, rec) for rec in records)
+            if matches_filter(r, node, GEO_FIELD_TYPES)
+        }
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expected
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "key,bound,expect",
+    [
+        ("lte", float("inf"), {"a"}),
+        ("lt", float("inf"), {"a"}),
+        ("gte", float("-inf"), {"a"}),
+        ("gte", float("inf"), set()),
+        ("lte", 2**63, {"a"}),
+        ("gte", 2**63, set()),
+    ],
+)
+def test_infinite_and_boundary_bounds_on_an_int_column(
+    dsn: str, test_schema: str, key: str, bound: float, expect: set[str]
+) -> None:
+    """Infinity and the exact bigint boundary saturate rather than match nothing.
+
+    ``float(2**63 - 1)`` rounds up to ``2**63``, so a float comparison missed
+    the very boundary the saturation logic exists for.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "level": 1, "vector": vec(1)})
+        node = {"op": "range", "field": "level", key: bound}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
+    finally:
+        adapter.close()
+
+
+def test_legacy_vectorless_row_can_be_rewritten(dsn: str, test_schema: str) -> None:
+    """A row left without an embedding must not become permanently unwritable.
+
+    OpenViking's read-modify-write paths re-upsert exactly what they fetched,
+    and a legacy row reads back with no vector key. Refusing that would leave
+    it stuck forever, since ``backfill_defaults`` cannot invent an embedding.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        inner = adapter.get_collection()._Collection__collection
+        inner._execute(
+            sql.SQL("INSERT INTO {}.{} (id, level) VALUES (%s, %s)").format(
+                sql.Identifier(inner._db_schema), sql.Identifier(inner._table)
+            ),
+            ("legacy", 1),
+        )
+        record = adapter.get(["legacy"])[0]
+        assert "vector" not in record
+
+        adapter.upsert(record | {"level": 2})
+        assert adapter.get(["legacy"])[0]["level"] == 2
+
+        # A genuinely new record still needs one.
+        with pytest.raises(ValueError, match="embedding is required"):
+            adapter.upsert({"id": "brand-new", "level": 1})
+    finally:
+        adapter.close()
+
+
+def test_hybrid_order_agrees_with_the_reported_score(dsn: str, test_schema: str) -> None:
+    """A vectorless row must not sit at position 0 holding the lowest score.
+
+    ``coalesce(dense, 0.0)`` is the best possible dense term for l2 and ip, so
+    ordering by the raw score put such a row first while its reported score was
+    floored below every real one.
+    """
+    config = VectorDBBackendConfig(
+        backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+        name="context",
+        index_name="default",
+        distance_metric="l2",
+        sparse_weight=1.0,
+        custom_params={"dsn": dsn, "schema": test_schema},
+    )
+    adapter = PgVectorCollectionAdapter.from_config(config)
+    adapter.create_collection(
+        "context", META, distance="l2", sparse_weight=1.0, index_name="default"
+    )
+    try:
+        adapter.upsert({"id": "real", "vector": vec(1), "sparse_vector": {"7": 1.0}})
+        inner = adapter.get_collection()._Collection__collection
+        inner._execute(
+            sql.SQL(
+                "INSERT INTO {}.{} (id, sparse_vector) VALUES (%s, %s::jsonb)"
+            ).format(sql.Identifier(inner._db_schema), sql.Identifier(inner._table)),
+            ("legacy", '{"7": 1.0}'),
+        )
+
+        results = adapter.query(
+            query_vector=vec(1), sparse_query_vector={"7": 1.0}, limit=10
+        )
+        assert results[0]["id"] == "real"
+        scores = [r["_score"] for r in results]
+        assert scores == sorted(scores, reverse=True), results
     finally:
         adapter.close()

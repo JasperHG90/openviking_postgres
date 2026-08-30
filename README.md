@@ -350,6 +350,25 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
 
+## Every record needs an embedding
+
+`upsert` refuses a record with no vector. OpenViking's own validator marks the
+vector field required, so such a row cannot exist on the built-in backend
+either — and pgvector's HNSW and IVFFlat builds skip NULL vectors, so a row
+without one would be counted but never returned by an index scan.
+
+A database written by an earlier version of this package may hold such rows.
+They can still be read and rewritten as they are, so OpenViking's
+read-modify-write paths keep working, but they stay invisible to approximate
+search. `backfill_defaults` repairs missing scalars; it cannot invent an
+embedding. To find them:
+
+```sql
+SELECT id FROM openviking.ov_context WHERE vector IS NULL;
+```
+
+Re-index those URIs through OpenViking to give them embeddings, or delete them.
+
 ## Upgrading an existing database
 
 Omitted fields are stored with the engine's own defaults — an absent `level` is

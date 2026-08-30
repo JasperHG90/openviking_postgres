@@ -68,6 +68,8 @@ def parse_datetime_to_epoch_ms(value: object, tz_policy: str = "local") -> int:
     if isinstance(value, bool):
         raise ValueError("date_time value must be string or number, got bool")
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"date_time value must be finite, got {value!r}")
         return int(value)
     if not isinstance(value, str):
         raise ValueError(
@@ -583,10 +585,10 @@ class FilterCompiler:
             The operand in the form the column expects.
         """
         if for_ordering and spec.ov_type == "bool":
-            # The column is cast to int for ordering, so the bound keeps its
-            # numeric value rather than collapsing to a boolean -- `flag >= 2`
-            # must be false, not `flag >= TRUE`.
-            return value
+            # The column is cast to int for ordering, so the bound must be an
+            # integer too -- `flag >= 2` must be false rather than
+            # `flag >= TRUE`, and a boolean bound must not stay a boolean.
+            return int(value) if isinstance(value, bool) else value
         if spec.is_datetime and value is not None:
             return parse_datetime_to_epoch_ms(value, self._tz_policy)
         return _coerce_operand(spec, value)
@@ -649,6 +651,8 @@ def _is_comparable(spec: FieldSpec, value: object, *, for_ordering: bool = False
         if spec.ov_type in ("int64", "list<int64>") and not (
             _BIGINT_MIN <= value <= _BIGINT_MAX
         ):
+            # Infinity is excluded here as "unstorable", but as a *bound* it is
+            # meaningful; `_saturating_bound` resolves it before this matters.
             return False
         if (
             spec.ov_type == "float32"
@@ -739,12 +743,18 @@ def _saturating_bound(spec: FieldSpec, key: str, value: object) -> bool | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if isinstance(value, float) and not math.isfinite(value):
+    if isinstance(value, float) and math.isnan(value):
         return None
-    low: float
-    high: float
+    if value == math.inf:
+        return key in ("lt", "lte")
+    if value == -math.inf:
+        return key in ("gt", "gte")
+    low: int | float
+    high: int | float
     if spec.ov_type in ("int64", "list<int64>"):
-        low, high = float(_BIGINT_MIN), float(_BIGINT_MAX)
+        # Exact integers: float(2**63 - 1) rounds up to 2**63, so comparing in
+        # floating point would miss the very boundary this exists to catch.
+        low, high = _BIGINT_MIN, _BIGINT_MAX
     elif spec.ov_type == "float32":
         low, high = -_REAL_MAX, _REAL_MAX
     else:

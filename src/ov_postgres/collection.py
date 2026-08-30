@@ -60,7 +60,9 @@ DEFAULT_KEYWORD_FIELDS = ("name", "description", "abstract", "tags", "search_tag
 # OpenViking's HierarchicalRetriever re-sorts candidates by `_score` in Python
 # and applies an absolute threshold, so a vectorless row reporting 0.0 would
 # overtake a genuine but distant match and pass a threshold of zero.
-NO_VECTOR_SCORE = -1e30
+# Below any score pgvector can produce: distances are float4, so the
+# largest magnitude a negated `ip` term can reach is ~3.4e38.
+NO_VECTOR_SCORE = -1e308
 
 # GUC namespaces for iterative scan, as SQL literals so nothing derived from
 # configuration is spliced into a statement as raw text.
@@ -380,6 +382,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             method = "flat" if index_type.startswith("flat") else "hnsw"
         else:
             method = self._index_method
+        # Recorded so `_iterative_scan_setup` sees the resolved method; with
+        # "auto" left in place the GUC was never emitted and an ANN search
+        # silently truncated at hnsw.ef_search.
+        self._index_method = method
 
         statements: list[Statement] = list(
             ddl.scalar_index_statements(self._db_schema, self._table, self._schema)
@@ -927,7 +933,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             statement,
             params,
             fetch="all",
-            setup=self._iterative_scan_setup(filtered=bool(filters)),
+            setup=self._iterative_scan_setup(),
         )
         # Floored whenever a dense vector was asked for, hybrid included. The
         # dense half of a hybrid score is fabricated for a row with no
@@ -1318,9 +1324,18 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 ),
                 [_format_vector(dense_vector)],
             )
-        # Hybrid, or no dense vector at all: rank by the combined score. Rows
-        # without an embedding contribute 0 from the dense term and sort behind
-        # anything with a real similarity by virtue of the score itself.
+        # Hybrid, or no dense vector at all: rank by the combined score. When a
+        # dense vector was supplied, rows without an embedding are pushed last
+        # explicitly -- their dense term is `coalesce(..., 0.0)`, which for l2
+        # and ip is the best possible value and would otherwise outrank genuine
+        # matches whose score is reported below theirs.
+        if dense_vector is not None and vector_field is not None:
+            return (
+                sql.SQL("({} IS NOT NULL) DESC, _score DESC NULLS LAST").format(
+                    sql.Identifier(vector_field.name)
+                ),
+                [],
+            )
         return sql.SQL("_score DESC NULLS LAST"), []
 
     def _score_expression(
@@ -1370,7 +1385,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return sql.SQL("0.0::double precision"), []
         return sql.SQL("({})").format(sql.SQL(" + ").join(terms)), params
 
-    def _iterative_scan_setup(self, *, filtered: bool = True) -> list[Statement]:
+    def _iterative_scan_setup(self) -> list[Statement]:
         """Build the ``SET LOCAL`` prelude for a filtered ANN search.
 
         An ANN index visits a fixed candidate pool and only then applies the
@@ -1390,17 +1405,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ``LIMIT 200`` silently returned 40 rows once the index was actually
         being used.
 
-        Parameters
-        ----------
-        filtered :
-            Accepted for call-site clarity; the GUC is needed either way.
-
         Returns
         -------
         list[Statement]
             Zero or one ``SET LOCAL`` statement.
         """
-        del filtered  # every ANN search needs this, not only a filtered one
         if self._iterative_scan == "off":
             return []
         if self._index_method not in ("hnsw", "ivfflat"):
@@ -1634,6 +1643,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         rows: list[list[Any]] = []
         ids: list[str] = []
+        vectorless: list[str] = []
         for record in data_list:
             names, values, extra = self._split_record(record)
             mapping: dict[str, Any] = dict(defaults)
@@ -1642,17 +1652,58 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             if mapping.get(pk) is None:
                 raise ValueError(f"upsert record is missing primary key {pk!r}")
             if vector_field is not None and mapping.get(vector_field.name) is None:
-                # The engine's validator marks the vector Required, so no such
-                # row can exist there. Allowing one here would also make it
-                # invisible: pgvector's HNSW and IVFFlat builds skip NULL
-                # vectors, so an index scan can never return it.
-                raise ValueError(
-                    f"record {mapping[pk]!r} has no {vector_field.name!r}: "
-                    "an embedding is required, as the built-in backend requires it"
-                )
+                vectorless.append(str(mapping[pk]))
             ids.append(str(mapping[pk]))
             rows.append([mapping.get(name) for name in columns])
+
+        if vectorless:
+            self._reject_new_vectorless(vectorless, vector_field)
         return columns, rows, ids
+
+    def _reject_new_vectorless(
+        self, ids: list[str], vector_field: FieldSpec | None
+    ) -> None:
+        """Refuse a *new* record with no embedding, but allow rewriting an old one.
+
+        The engine's validator marks the vector Required, and pgvector's index
+        builds skip NULL vectors, so a row without one is both impossible there
+        and invisible to an index scan here. A database written by an earlier
+        version may still hold such rows, and OpenViking's read-modify-write
+        paths re-upsert exactly what they fetched -- which for those rows has no
+        vector. Rejecting that would leave them permanently unwritable with no
+        way to repair them, so an existing row is allowed to be rewritten as it
+        already is.
+
+        Parameters
+        ----------
+        ids :
+            Primary keys of records that arrived without an embedding.
+        vector_field :
+            The collection's vector field.
+
+        Raises
+        ------
+        ValueError
+            If any of them names a row that does not already exist.
+        """
+        if vector_field is None:
+            return
+        pk = sql.Identifier(self._schema.primary_key.name)
+        rows = self._execute(
+            sql.SQL("SELECT {pk} FROM {table} WHERE {pk} = ANY(%s)").format(
+                pk=pk, table=self._qualified
+            ),
+            (ids,),
+            fetch="all",
+        )
+        existing = {str(row[self._schema.primary_key.name]) for row in rows}
+        new = [i for i in ids if i not in existing]
+        if new:
+            raise ValueError(
+                f"record(s) {', '.join(sorted(new)[:5])!r} have no "
+                f"{vector_field.name!r}: an embedding is required, as the "
+                "built-in backend requires one"
+            )
 
     def _adapt_value(self, spec: FieldSpec, value: object) -> object:
         """Convert a Python value into something psycopg can bind."""
