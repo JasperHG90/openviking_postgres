@@ -479,16 +479,26 @@ class FilterCompiler:
         node: Mapping[str, Any],
         params: list[Any],
     ) -> sql.Composable:
-        """Compile a bounded comparison, negating for ``range_out``."""
+        """Compile a bounded comparison, negating for ``range_out``.
+
+        A range with no bounds at all is not a no-op: the reference rejects
+        only a missing *value*, so a present value passes every absent check
+        and matches. That case falls through to the ``IS NOT NULL`` test below,
+        for arrays as much as for scalars.
+
+        A *bounded* range on an array column short-circuits to no match, since
+        an array has no ordering against a scalar bound.
+        """
         col = _col(spec.name)
+        bounded = any(node.get(key) is not None for key in ("gt", "gte", "lt", "lte"))
 
         # An array column has no ordering against a scalar bound. The reference
-        # evaluates `list >= 2`, catches the TypeError and returns False, so the
-        # filter must match nothing rather than reach PostgreSQL as
-        # `bigint[] >= smallint`. Checking the element type is not enough:
-        # list<int64> against an int bound has a compatible element type and
-        # still cannot be compared.
-        if spec.is_array:
+        # evaluates `list >= 2`, catches the TypeError and returns False, so a
+        # *bounded* range on an array must match nothing rather than reach
+        # PostgreSQL as `bigint[] >= smallint`. Checking the element type is not
+        # enough: list<int64> against an int bound has a compatible element type
+        # and still cannot be ordered.
+        if spec.is_array and bounded:
             return sql.SQL("TRUE") if op == "range_out" else sql.SQL("FALSE")
 
         comparisons = (
@@ -525,10 +535,15 @@ class FilterCompiler:
         return inner
 
     def _coerce(self, spec: FieldSpec, value: object) -> object:
-        """Apply the same type conversion the native engine applies on write."""
+        """Apply the same type conversion the native engine applies on write.
+
+        Also converts a boolean/integer operand to the column's own type, so
+        the ``True == 1`` equivalence Python gives the reference survives into
+        SQL, where the two types have no implicit comparison.
+        """
         if spec.is_datetime and value is not None:
             return parse_datetime_to_epoch_ms(value, self._tz_policy)
-        return value
+        return _coerce_operand(spec, value)
 
 
 # Python types that can meaningfully compare against each column type. The
@@ -551,10 +566,12 @@ _COMPARABLE_TYPES: dict[str, tuple[type, ...]] = {
 def _is_comparable(spec: FieldSpec, value: object) -> bool:
     """Return whether ``value`` can be compared against ``spec``'s column.
 
-    ``bool`` is handled separately from ``int`` despite being a subclass:
-    PostgreSQL has no implicit boolean/bigint comparison, so binding ``True``
-    against a ``bigint`` column raises where Python would have said ``True == 1``.
-    That divergence is deliberate and narrow.
+    Python compares ``True == 1``, so the reference matches a boolean against
+    an integer operand and vice versa. PostgreSQL has no implicit
+    boolean/bigint comparison, so those operands are converted by
+    :func:`_coerce_operand` rather than dropped. Only ``0`` and ``1`` convert:
+    the reference finds no match for ``True == 2`` either, so a wider integer
+    against a boolean column is correctly not comparable.
 
     Parameters
     ----------
@@ -571,11 +588,35 @@ def _is_comparable(spec: FieldSpec, value: object) -> bool:
     allowed = _COMPARABLE_TYPES.get(spec.ov_type)
     if allowed is None:
         return False
+    if spec.ov_type == "bool":
+        # bool(2) would be True, but the reference says `True == 2` is False.
+        return isinstance(value, bool) or (isinstance(value, int) and value in (0, 1))
     if isinstance(value, bool):
-        return bool in allowed
-    if bool in allowed:
-        return False
+        # A boolean against a numeric column compares as 1/0, as Python does.
+        return any(t in allowed for t in (int, float))
     return isinstance(value, allowed)
+
+
+def _coerce_operand(spec: FieldSpec, value: object) -> object:
+    """Convert an operand to the column's own type where Python would compare.
+
+    Parameters
+    ----------
+    spec :
+        The column the operand is compared against.
+    value :
+        An operand already accepted by :func:`_is_comparable`.
+
+    Returns
+    -------
+    object
+        The operand as the column's type.
+    """
+    if spec.ov_type == "bool" and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, bool) and spec.ov_type in ("int64", "float32", "list<int64>"):
+        return int(value)
+    return value
 
 
 def _col(name: str) -> sql.Composable:

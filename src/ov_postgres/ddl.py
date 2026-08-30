@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from psycopg import sql
@@ -48,12 +49,38 @@ def parse_extension_version(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def advisory_lock_key(schema_name: str) -> int:
+    """Derive a stable 63-bit advisory-lock key from a schema name.
+
+    ``hash()`` is salted per process and would give each server a different
+    key, so a deterministic digest is used instead.
+
+    Parameters
+    ----------
+    schema_name :
+        The schema being bootstrapped.
+
+    Returns
+    -------
+    int
+        A key that fits PostgreSQL's ``bigint`` advisory-lock argument.
+    """
+    digest = hashlib.sha256(f"ov_postgres.bootstrap.{schema_name}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") >> 1
+
+
 def bootstrap_statements(
     schema_name: str, *, create_extension: bool = True
 ) -> list[Statement]:
     """Build the statements that make a database usable.
 
-    Every statement is idempotent, so this runs on each startup.
+    The statements run in one transaction, and the first takes a PostgreSQL
+    advisory lock keyed on the schema name. ``IF NOT EXISTS`` is check-then-act
+    rather than atomic, so without that lock two servers starting together race
+    and lose: PostgreSQL reports ``UniqueViolation`` on ``pg_namespace`` or
+    ``pg_proc``, or ``tuple concurrently updated`` from ``CREATE EXTENSION``.
+    A per-process ``threading.Lock`` cannot help, since the racing parties are
+    usually different processes.
 
     Parameters
     ----------
@@ -66,13 +93,17 @@ def bootstrap_statements(
     Returns
     -------
     list[Statement]
-        Statements to execute in order.
+        Statements to execute in order, inside a single transaction.
     """
     ns = sql.Identifier(schema_name)
     extension: list[Statement] = (
         [sql.SQL("CREATE EXTENSION IF NOT EXISTS vector")] if create_extension else []
     )
     return [
+        # Held until the transaction ends, serialising concurrent bootstraps.
+        sql.SQL("SELECT pg_advisory_xact_lock({})").format(
+            sql.Literal(advisory_lock_key(schema_name))
+        ),
         sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(ns),
         *extension,
         _path_matches_fn(schema_name),

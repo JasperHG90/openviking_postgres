@@ -14,7 +14,7 @@ OpenViking ships five vector backends — `local`, `cuvs`, `http`, `volcengine`,
 - **Every field becomes a real typed column**, so filters compile to ordinary SQL over ordinary indexes — and you can inspect your agent's memory with `psql`.
 - **Exact search by default.** Switch to HNSW or IVFFlat when volume demands it, with version-gated iterative scan so a selective filter never silently returns a short page.
 - **Lexical keyword search** over your text columns, via PostgreSQL full-text search — no embedding model needed.
-- **Filter behaviour is checked against OpenViking's own evaluator** by 1,665 differential cases in the integration suite, covering every filterable field type, so a filter behaves the same here as on the built-in backend.
+- **Filter behaviour is checked against OpenViking's own filter evaluator** by 1,665 differential cases in the integration suite, covering every filterable field type.
 - **Runs on managed PostgreSQL** where your role cannot `CREATE EXTENSION`.
 
 ## Quick start
@@ -123,11 +123,11 @@ Confirm it landed where OpenViking will find it:
 
 ```bash
 git clone https://github.com/JasperHG90/openviking_postgres
-cd ov-postgres
+cd openviking_postgres
 uv sync
 ```
 
-The version comes from git tags via `hatch-vcs`, so a clone without tags builds as `0.0.0+unknown`. Use `git clone` rather than a source archive, and keep `fetch-depth: 0` in any CI that builds.
+The version comes from git tags via `hatch-vcs`. A clone without tags still builds, but as a development version derived from the commit (`0.1.dev9+gb2dcc94e`) rather than the release number, so keep `fetch-depth: 0` in any CI that builds a release.
 
 ### Docker for local development
 
@@ -393,7 +393,7 @@ uv run pytest -m integration
 
 Point it at a server you already have with `OV_POSTGRES_TEST_DSN` instead. Each test runs in a throwaway schema that is dropped afterwards.
 
-The suite's centrepiece is `test_filter_semantics_match_reference` — part of the **integration** suite, so `uv run pytest` alone does not exercise it. Across two schemas it generates random records and **1,665 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. That is what pins this backend to native behaviour rather than to an interpretation of it.
+The suite's centrepiece is `test_filter_semantics_match_reference` — part of the **integration** suite, so `uv run pytest` alone does not exercise it. Across two schemas it generates random records and **1,665 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. The reference is `matches_filter` in `cuvs_index.py` -- OpenViking's pure-Python filter evaluator, and the clearest statement of what the DSL means. The `local` backend evaluates the same DSL in a compiled engine, so agreement there is strongly implied but not directly proven.
 
 Between them the two schemas cover every filterable field type: `string`, `text`, `path`, `int64`, `float32`, `bool`, `list<string>` and `list<int64>`. The three that are absent cannot be compared -- the reference evaluator refuses `date_time` and `geo_point` outright, and `sparse_vector` is not filterable.
 
@@ -402,12 +402,12 @@ Between them the two schemas cover every filterable field type: `string`, `text`
 Run the gates before opening a pull request:
 
 ```bash
-uv run ruff check ov_postgres tests
-uv run ruff format --check ov_postgres tests
+uv run ruff check src tests
+uv run ruff format --check src tests
 uv run mypy
 uv run pytest
 ```
 
-These are wired into `.pre-commit-config.yaml`; `prek run --all-files` runs them all once the project is a git repository.
+These are wired into `.pre-commit-config.yaml`, so `prek run --all-files` runs them all.
 
 Issues and pull requests are welcome. If you hit a filter that behaves differently from the `local` backend, that is a bug — please include the filter and both results.

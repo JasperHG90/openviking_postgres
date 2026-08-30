@@ -274,13 +274,18 @@ def test_vector_search_respects_filter(adapter: PgVectorCollectionAdapter) -> No
     assert [r["id"] for r in results] == ["b"]
 
 
-def test_rows_without_vectors_are_excluded_from_vector_search(
+def test_rows_without_vectors_rank_last_in_vector_search(
     adapter: PgVectorCollectionAdapter,
 ) -> None:
-    """A row with no vector cannot appear in a dense ranking."""
+    """A row with no vector sorts last rather than disappearing.
+
+    Excluding it looked right for a dense ranking, but the same code path
+    serves filter-only queries, so the row also vanished from
+    ``delete(filter=...)`` while ``count()`` still counted it.
+    """
     adapter.upsert([{"id": "novec", "name": "x"}, {"id": "hasvec", "vector": vec(1)}])
     results = adapter.query(query_vector=vec(1), limit=10)
-    assert [r["id"] for r in results] == ["hasvec"]
+    assert [r["id"] for r in results] == ["hasvec", "novec"]
 
 
 def test_limit_and_offset(adapter: PgVectorCollectionAdapter) -> None:
@@ -880,3 +885,104 @@ def test_filter_semantics_match_reference_for_remaining_types(
 
     assert checked > 400, f"expected a broad sweep, only compared {checked} filters"
     assert not skipped, f"{len(skipped)} filters were never compared: {skipped[:3]}"
+
+
+@pytest.mark.parametrize("field", ["search_tags", "level"])
+@pytest.mark.parametrize("op", ["range", "range_out"])
+def test_range_without_bounds_matches_present_values(
+    adapter: PgVectorCollectionAdapter, field: str, op: str
+) -> None:
+    """A range carrying no bounds tests only for a present value.
+
+    ``Range(field)`` with every bound left as None compiles to a bare
+    ``{"op": "range", "field": ...}``. The reference rejects only a missing
+    *value*, so a present one passes every absent check and matches. Guarding
+    array columns unconditionally made this return nothing.
+    """
+    records: list[dict[str, Any]] = [
+        {"id": "has", "level": 3, "search_tags": ["x"], "vector": vec(1)},
+        {"id": "empty", "vector": vec(2)},
+    ]
+    adapter.upsert(records)
+
+    node = {"op": op, "field": field}
+    expected = {r["id"] for r in records if matches_filter(r, node, FIELD_TYPES)}
+    actual = {r["id"] for r in adapter.query(filter=node, limit=50)}
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        {"op": "must", "field": "flag", "conds": [1]},
+        {"op": "must", "field": "flag", "conds": [0]},
+        {"op": "must_not", "field": "flag", "conds": [1]},
+        {"op": "range", "field": "flag", "gte": 0},
+        {"op": "must", "field": "flag", "conds": [2]},
+        {"op": "must", "field": "score", "conds": [True]},
+        {"op": "range", "field": "score", "gte": True},
+    ],
+)
+def test_bool_and_int_operands_interoperate(
+    wide_adapter: PgVectorCollectionAdapter, node: dict[str, Any]
+) -> None:
+    """Python compares ``True == 1``; the SQL must agree in both directions.
+
+    PostgreSQL has no implicit boolean/bigint comparison, so these operands are
+    converted rather than dropped. ``2`` against a boolean column still matches
+    nothing, because the reference finds ``True == 2`` false as well.
+    """
+    records: list[dict[str, Any]] = [
+        {"id": "t", "flag": True, "score": 1.0, "vector": vec(1)},
+        {"id": "f", "flag": False, "score": 0.0, "vector": vec(2)},
+        {"id": "none", "vector": vec(3)},
+    ]
+    wide_adapter.upsert(records)
+
+    expected = {r["id"] for r in records if matches_filter(r, node, WIDE_FIELD_TYPES)}
+    actual = {r["id"] for r in wide_adapter.query(filter=node, limit=50)}
+    assert actual == expected
+
+
+def test_rows_without_vectors_remain_findable_and_deletable(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """A record with no embedding must not become invisible to filters.
+
+    ``CollectionAdapter.query`` synthesises a random vector for filter-only
+    queries, so excluding vectorless rows from vector search also hid them from
+    ``delete(filter=...)`` and ``scroll`` -- while ``count()`` still counted
+    them, leaving a row that could be neither found nor removed.
+    """
+    adapter.upsert(
+        [
+            {"id": "novec", "level": 1, "vector": None},
+            {"id": "hasvec", "level": 1, "vector": vec(1)},
+        ]
+    )
+    assert adapter.count() == 2
+
+    node = {"op": "must", "field": "level", "conds": [1]}
+    assert {r["id"] for r in adapter.query(filter=node, limit=50)} == {
+        "novec",
+        "hasvec",
+    }
+
+    assert adapter.delete(filter=node) == 2
+    assert adapter.count() == 0
+
+
+def test_dense_search_still_ranks_vectors_first(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """Sorting vectorless rows last must not disturb a real ranking."""
+    adapter.upsert(
+        [
+            {"id": "novec"},
+            {"id": "near", "vector": [1.0] + [0.0] * (DIM - 1)},
+            {"id": "far", "vector": [-1.0] + [0.0] * (DIM - 1)},
+        ]
+    )
+    ranked = [r["id"] for r in adapter.query(query_vector=[1.0] + [0.0] * (DIM - 1))]
+    assert ranked[:2] == ["near", "far"]
+    assert ranked[-1] == "novec"

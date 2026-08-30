@@ -21,16 +21,26 @@ env:
   UV_VERSION: '0.11.x'
 
 jobs:
+  # Run prek directly rather than through toiminnot/actions/prek: that action
+  # installs pre-commit (not prek) and never puts `uv` on PATH, which the
+  # pytest-unit hook's `uv run pytest` entry needs.
   pre-commit:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Run pre-commit checks
-        uses: JasperHG90/toiminnot/actions/prek@main
         with:
-          python_version: ${{ env.PYTHON_VERSION }}
-          prek_version: '0.2.25'
+          # hatch-vcs needs tags to resolve a version during `uv run`.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Run prek hooks
+        run: uvx prek@0.2.25 run --all-files --show-diff-on-failure
 
   tests:
     runs-on: ubuntu-latest
@@ -76,11 +86,12 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Build sdist and wheel
         run: uv build
+      # Install with its real dependencies: importing ov_postgres pulls in
+      # openviking, so a --no-deps check fails with ModuleNotFoundError.
       - name: Check the wheel installs and imports on its own
         run: |
           uv venv /tmp/wheelcheck
-          uv pip install --python /tmp/wheelcheck/bin/python --no-deps dist/*.whl
-          uv pip install --python /tmp/wheelcheck/bin/python "psycopg[binary,pool]>=3.1" "pydantic>=2"
+          uv pip install --python /tmp/wheelcheck/bin/python dist/*.whl
           /tmp/wheelcheck/bin/python -c "import ov_postgres; print(ov_postgres.__version__)"
       - uses: actions/upload-artifact@v4
         with:

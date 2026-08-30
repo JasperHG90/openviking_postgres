@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, overload
@@ -65,10 +66,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
     """A single OpenViking collection stored as one PostgreSQL table.
 
     Instances are safe to share across threads: every statement runs on its own
-    pooled connection, and the mutable attributes written after construction
-    (the cached schema and the active distance metric) are guarded by a lock.
-    The closed flag is read without the lock -- a single boolean assignment, so
-    a racing reader sees either state and never a torn value.
+    pooled connection. The lock serialises *writes* to the cached schema and the
+    active distance metric; those attributes and the closed flag are read
+    without it, which is sound because each is a single reference assignment --
+    a racing reader sees the old or the new value, never a torn one.
 
     Parameters
     ----------
@@ -805,16 +806,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
 
-        # Rows with no vector cannot participate in a dense ranking.
-        vector_field = self._schema.vector_field
-        if dense_vector is not None and vector_field is not None:
-            predicate = sql.SQL("({} AND {} IS NOT NULL)").format(
-                predicate, sql.Identifier(vector_field.name)
-            )
-
+        # A row with no vector scores NULL. It is sorted last rather than
+        # filtered out: `CollectionAdapter.query` synthesises a random vector
+        # for filter-only queries, so excluding those rows would also hide them
+        # from `delete(filter=...)`, `scroll` and `fetch_by_uri` -- while
+        # `count()` still counted them. That left a record written without an
+        # embedding both unfindable and undeletable.
         statement = sql.SQL(
             "SELECT {cols}, {score} AS _score FROM {table} WHERE {pred} "
-            "ORDER BY _score DESC LIMIT %s OFFSET %s"
+            "ORDER BY _score DESC NULLS LAST LIMIT %s OFFSET %s"
         ).format(
             cols=self._select_list(columns, include_extra=include_extra),
             score=score_expr,
@@ -1447,6 +1447,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return _format_vector(value)
         if spec.is_sparse:
             return json.dumps(value) if not isinstance(value, str) else value
+        if spec.ov_type == "float32" and isinstance(value, float):
+            # PostgreSQL sorts NaN above every number, while the reference's
+            # `_in_range` returns False for every comparison against it, so a
+            # stored NaN would diverge on every range filter. pgvector rejects
+            # it in a vector column for the same reason; do it for scalars too.
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError(
+                    f"float32 field {spec.name!r} cannot store {value!r}: "
+                    "NaN and infinity have no consistent ordering"
+                )
         if spec.is_datetime:
             return parse_datetime_to_epoch_ms(value, self._tz_policy)
         if spec.is_array:
