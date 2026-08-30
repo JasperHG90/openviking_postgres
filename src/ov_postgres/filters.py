@@ -21,6 +21,7 @@ A node may also be wrapped as ``{"filter": <node>}``.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -257,9 +258,10 @@ class FilterCompiler:
         # the reference evaluator compares with `in`/`==`, which is False for a
         # mismatched type rather than an error. Binding them would instead make
         # PostgreSQL raise UndefinedFunction and fail the whole query.
-        values = [
-            self._coerce(spec, value) for value in conds if _is_comparable(spec, value)
-        ]
+        values = _homogenise(
+            spec,
+            [self._coerce(spec, value) for value in conds if _is_comparable(spec, value)],
+        )
         matches_null = any(value is None for value in conds)
 
         if not values:
@@ -599,9 +601,17 @@ def _is_comparable(spec: FieldSpec, value: object) -> bool:
     allowed = _COMPARABLE_TYPES.get(spec.ov_type)
     if allowed is None:
         return False
+    if isinstance(value, float) and not math.isfinite(value):
+        # PostgreSQL orders NaN above every number and treats infinity as a
+        # real bound; the reference matches neither. Excluding them here keeps
+        # `lte=NaN` from selecting the whole table.
+        return False
     if spec.ov_type == "bool":
-        # bool(2) would be True, but the reference says `True == 2` is False.
-        return isinstance(value, bool) or (isinstance(value, int) and value in (0, 1))
+        # bool(2) would be True, but the reference says `True == 2` is False,
+        # so only 0 and 1 convert -- from int or from an integral float.
+        if isinstance(value, bool):
+            return True
+        return isinstance(value, (int, float)) and value in (0, 1)
     if isinstance(value, bool):
         if spec.ov_type in _NO_BOOL_OPERAND:
             return False
@@ -627,9 +637,41 @@ def _coerce_operand(spec: FieldSpec, value: object) -> object:
     """
     if spec.ov_type == "bool" and not isinstance(value, bool):
         return bool(value)
+    if spec.ov_type in ("int64", "list<int64>") and isinstance(value, float):
+        # Only an integral float can equal an integer; `_homogenise` drops the
+        # rest, and converting here keeps the list a single type.
+        return int(value) if value.is_integer() else value
     if isinstance(value, bool) and spec.ov_type in ("int64", "float32", "list<int64>"):
         return int(value)
     return value
+
+
+def _homogenise(spec: FieldSpec, values: list[Any]) -> list[Any]:
+    """Reduce an operand list to a single Python type.
+
+    psycopg refuses a heterogeneous list ("cannot dump lists of mixed types"),
+    which would fail the whole query where the reference simply compares each
+    element. Integer columns additionally drop non-integral floats: no integer
+    equals ``3.5``, and leaving it in would let the ``::bigint[]`` cast round it
+    to ``4`` and match a value the reference does not.
+
+    Parameters
+    ----------
+    spec :
+        The column the operands are compared against.
+    values :
+        Operands already accepted by :func:`_is_comparable` and coerced.
+
+    Returns
+    -------
+    list[Any]
+        Operands of one type, safe to bind as an array.
+    """
+    if spec.ov_type in ("int64", "list<int64>"):
+        return [v for v in values if isinstance(v, int) and not isinstance(v, bool)]
+    if spec.ov_type == "float32":
+        return [float(v) for v in values if isinstance(v, (int, float))]
+    return values
 
 
 def _col(name: str) -> sql.Composable:

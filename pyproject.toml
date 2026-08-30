@@ -1,5 +1,7 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+# hatchling 1.27 is the first release emitting PEP 639 License-Expression
+# metadata; older versions silently fall back to a free-text License field.
+requires = ["hatchling>=1.27", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +10,9 @@ dynamic = ["version"]
 description = "PostgreSQL + pgvector backend for OpenViking's vector store"
 readme = "README.md"
 # ov_postgres imports and links against openviking, which is AGPL-3.0.
-license = "AGPL-3.0-or-later"
+# openviking declares AGPL-3.0 with no "or later", and a combined work
+# cannot widen that.
+license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 keywords = ["openviking", "pgvector", "postgresql", "vector-database"]

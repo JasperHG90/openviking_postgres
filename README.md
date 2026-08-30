@@ -350,6 +350,29 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
 
+## Upgrading an existing database
+
+Omitted fields are stored with the engine's own defaults — an absent `level` is
+`0`, an absent `name` is `""` — so a filter behaves the same here as on the
+built-in backend. Rows written by an earlier version of this package kept NULL
+instead, so a database that predates it holds two populations and `level == 0`
+finds only the newer rows.
+
+Repair it once:
+
+```python
+from openviking_cli.utils.config import get_openviking_config
+from openviking.storage.vectordb_adapters.factory import create_collection_adapter
+
+adapter = create_collection_adapter(get_openviking_config().storage.vectordb)
+collection = adapter.get_collection()
+print(collection.backfill_defaults(), "rows repaired")
+adapter.close()
+```
+
+It only touches columns that are NULL, never the primary key, vectors,
+timestamps or geo points, and is safe to run more than once.
+
 ## Troubleshooting
 
 **`Vector backend ov_postgres.adapter.PgVectorCollectionAdapter is not supported`**

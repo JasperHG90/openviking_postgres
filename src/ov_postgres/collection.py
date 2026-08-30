@@ -55,12 +55,13 @@ _DISTANCE: dict[str, tuple[sql.SQL, sql.SQL]] = {
 
 DEFAULT_KEYWORD_FIELDS = ("name", "description", "abstract", "tags", "search_tags")
 
-# Score given to a row with no dense vector when one was requested. Every real
-# metric produces a far larger value -- cosine bottoms out at -1, and l2/ip are
-# negated distances -- so such a row sorts last while keeping the reported
-# score monotonic with the ordering. Mapping it to 0.0 instead would place it
-# above any negative real score and let a threshold check admit it.
-_NO_VECTOR_SCORE = sql.SQL("(-1e30)")
+# Rows carrying a dense vector sort ahead of rows without one, as a separate
+# ordering key rather than a sentinel folded into the score. A sentinel cannot
+# work: any value small enough to sit below every real score (l2 distances
+# overflow to infinity, `ip` reaches 2e38) also swamps the sparse term, so
+# `sentinel + sparse == sentinel` and sparse-only rows stop being ordered
+# against each other.
+_HAS_VECTOR_FIRST = sql.SQL("({} IS NOT NULL) DESC")
 
 # GUC namespaces for iterative scan, as SQL literals so nothing derived from
 # configuration is spliced into a statement as raw text.
@@ -721,6 +722,53 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         )
         return True
 
+    def backfill_defaults(self) -> int:
+        """Set the engine default on every column left NULL by an older write.
+
+        Defaults are applied on write, so rows stored before this backend began
+        applying them keep NULL scalars. One collection then holds two
+        populations, and a filter such as ``level == 0`` finds the newer rows
+        and misses the older ones. Running this once after upgrading makes the
+        table consistent.
+
+        Safe to repeat: it only touches columns that are NULL, and never the
+        primary key, vectors, timestamps or geo points -- the fields the engine
+        itself leaves unset.
+
+        Returns
+        -------
+        int
+            Number of rows updated.
+        """
+        self._check_open()
+        assignments: list[Statement] = []
+        params: list[Any] = []
+        predicates: list[Statement] = []
+        for spec in self._schema.fields:
+            if spec.is_geo:
+                continue
+            default = default_for(spec)
+            if default is None:
+                continue
+            column = sql.Identifier(spec.name)
+            assignments.append(
+                sql.SQL("{} = coalesce({}, {})").format(column, column, sql.Placeholder())
+            )
+            params.append(self._adapt_value(spec, default))
+            predicates.append(sql.SQL("{} IS NULL").format(column))
+
+        if not assignments:
+            return 0
+
+        statement = sql.SQL("UPDATE {} SET {} WHERE {}").format(
+            self._qualified,
+            sql.SQL(", ").join(assignments),
+            sql.SQL(" OR ").join(predicates),
+        )
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(statement, params)
+            return int(cur.rowcount)
+
     def delete_all_data(self) -> bool:
         """Remove every row, leaving the table and its indexes in place.
 
@@ -824,10 +872,21 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # from `delete(filter=...)`, `scroll` and `fetch_by_uri` -- while
         # `count()` still counted them. That left a record written without an
         # embedding both unfindable and undeletable.
+        # Two ordering keys, not one: a row with no embedding has no comparable
+        # similarity, so it is ranked behind every row that has one, and only
+        # then by whatever score it does have (its sparse contribution, if any).
+        vector_field = self._schema.vector_field
+        leading: Statement = sql.SQL("")
+        if dense_vector is not None and vector_field is not None:
+            leading = sql.SQL("{}, ").format(
+                _HAS_VECTOR_FIRST.format(sql.Identifier(vector_field.name))
+            )
+
         statement = sql.SQL(
             "SELECT {cols}, {score} AS _score FROM {table} WHERE {pred} "
-            "ORDER BY _score DESC NULLS LAST LIMIT %s OFFSET %s"
+            "ORDER BY {leading}_score DESC NULLS LAST LIMIT %s OFFSET %s"
         ).format(
+            leading=leading,
             cols=self._select_list(columns, include_extra=include_extra),
             score=score_expr,
             table=self._qualified,
@@ -1193,13 +1252,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 sql.Placeholder(),
             )
             params.append(_format_vector(dense_vector))
-            # COALESCE, not a bare score: a NULL dense term would otherwise
-            # swallow the sparse term too (NULL + x = NULL), sinking a strong
-            # sparse-only match below rows it should outrank.
+            # A missing vector contributes nothing rather than NULL, which
+            # would swallow the sparse term as well (NULL + x = NULL). Ordering
+            # keeps such a row behind every vectored one regardless.
             terms.append(
-                sql.SQL("coalesce({}, {})").format(
-                    score_template.format(distance), _NO_VECTOR_SCORE
-                )
+                sql.SQL("coalesce({}, 0.0)").format(score_template.format(distance))
             )
 
         sparse_field = self._schema.sparse_field
@@ -1406,7 +1463,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # engine does; unparseable values fall through to `extra`.
                 try:
                     lon, lat = _parse_geo_point(value)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     extra[key] = value
                     continue
                 columns.extend([spec.name + "_lon", spec.name + "_lat"])
@@ -1494,7 +1551,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             # strings "NaN" and "Infinity" for a real column just as readily.
             try:
                 numeric = float(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 numeric = 0.0
             if math.isnan(numeric) or math.isinf(numeric):
                 raise ValueError(
@@ -1502,6 +1559,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     "NaN and infinity have no consistent ordering"
                 )
         if spec.is_datetime:
+            # The engine's own default for a timestamp is "", and it drops the
+            # field rather than storing one. A record copied from the built-in
+            # backend carries that value, so it must round-trip to NULL.
+            if value == "":
+                return None
             return parse_datetime_to_epoch_ms(value, self._tz_policy)
         if spec.is_array:
             if isinstance(value, str):

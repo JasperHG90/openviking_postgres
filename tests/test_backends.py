@@ -620,13 +620,16 @@ def test_declared_null_column_is_not_shadowed_by_extra(
                     sql.SQL("UPDATE {}.{} SET extra = %s WHERE id = %s").format(
                         sql.Identifier(test_schema), sql.Identifier("ov_context")
                     ),
-                    ('{"name": "STALE"}', "a"),
+                    ('{"loc": "9.9,9.9", "name": "STALE"}', "a"),
                 )
                 conn.commit()
 
         record = adapter.get(["a"])[0]
-        # The declared column wins: it holds the engine default, not the stale
-        # copy that was planted in `extra`.
+        # `loc` is genuinely NULL -- geo_point takes no default -- so this is
+        # the case the guard exists for: a declared column must win even when
+        # its value is absent, or a stale copy in `extra` would be reported as
+        # the row's location.
+        assert "loc" not in record, f"stale extra leaked: {record}"
         assert record["name"] == "", f"stale extra leaked: {record}"
     finally:
         adapter.close()
@@ -750,5 +753,103 @@ def test_filtered_hnsw_search_returns_a_full_page(dsn: str, test_schema: str) ->
         node = {"op": "must", "field": "level", "conds": [1]}
         results = adapter.query(query_vector=vec(7), filter=node, limit=20)
         assert len(results) == 20, f"index returned short: {len(results)}"
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "field,conds,expect",
+    [
+        ("counts", [1, 1.5], {"t"}),
+        ("counts", [1.5], set()),
+        ("counts", [-0.4], set()),
+        ("counts", [2.0], {"t"}),
+        ("score", [0.5, 1], {"t"}),
+    ],
+)
+def test_mixed_and_fractional_numeric_operands(
+    dsn: str, test_schema: str, field: str, conds: list[Any], expect: set[str]
+) -> None:
+    """Numeric operand lists must bind as one type and never be rounded.
+
+    psycopg refuses a heterogeneous list outright, and the ``::bigint[]`` cast
+    on an integer array silently rounds a fractional operand -- ``ARRAY[1.5]``
+    becomes ``{2}`` and matches a value the reference does not.
+    """
+    adapter = build_geo(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "t", "counts": [1, 2], "score": 0.5, "vector": vec(1)})
+        node = {"op": "must", "field": field, "conds": conds}
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("bound", [float("nan"), float("inf")])
+@pytest.mark.parametrize("key", ["lte", "lt", "gte", "gt"])
+def test_non_finite_range_bounds_match_nothing(
+    dsn: str, test_schema: str, bound: float, key: str
+) -> None:
+    """A NaN bound must not select the whole table.
+
+    PostgreSQL sorts NaN above every number, so ``level <= NaN`` was true for
+    every row, while the reference's ``_in_range`` matches none of them.
+    """
+    adapter = build_geo(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [
+                {"id": "a", "score": 1.0, "vector": vec(1)},
+                {"id": "b", "score": 5.0, "vector": vec(2)},
+            ]
+        )
+        node = {"op": "range", "field": "score", key: bound}
+        assert adapter.query(filter=node, limit=10) == []
+    finally:
+        adapter.close()
+
+
+def test_schema_declared_default_beats_the_type_default(
+    dsn: str, test_schema: str
+) -> None:
+    """``DefaultValue`` in the schema wins, as it does on the built-in engine."""
+    meta = {
+        "CollectionName": "context",
+        "Fields": [
+            {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+            {"FieldName": "level", "FieldType": "int64", "DefaultValue": 5},
+            {"FieldName": "vector", "FieldType": "vector", "Dim": DIM},
+        ],
+        "ScalarIndex": ["level"],
+    }
+    config = VectorDBBackendConfig(
+        backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+        name="context",
+        index_name="default",
+        custom_params={"dsn": dsn, "schema": test_schema},
+    )
+    adapter = PgVectorCollectionAdapter.from_config(config)
+    adapter.create_collection(
+        "context", meta, distance="cosine", sparse_weight=0.0, index_name="default"
+    )
+    try:
+        adapter.upsert({"id": "a", "vector": vec(1)})
+        assert adapter.get(["a"])[0]["level"] == 5
+    finally:
+        adapter.close()
+
+
+def test_empty_datetime_round_trips_from_the_local_backend(
+    dsn: str, test_schema: str
+) -> None:
+    """``created_at: ""`` is the engine's own default and must not raise.
+
+    ``LocalCollection.fetch_data`` returns it for any record without a
+    timestamp, so rejecting it made such a record impossible to copy here.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "created_at": "", "vector": vec(1)})
+        assert "created_at" not in adapter.get(["a"])[0]
     finally:
         adapter.close()

@@ -26,6 +26,7 @@ from openviking.storage.vectordb.index.cuvs_index import (
 )
 from openviking.storage.vectordb.utils.data_processor import DataProcessor
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+from psycopg import sql
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
 
@@ -93,6 +94,13 @@ def as_reference_row(meta: dict[str, Any], record: dict[str, Any]) -> dict[str, 
     fields = {f["FieldName"]: f for f in meta["Fields"]}
     processor = DataProcessor(fields_dict=fields, tz_policy="local")
     validated = processor.validate_and_process(record)
+    # `LocalCollection._write_data_list` pops the vector and sparse-vector keys
+    # before serialising, so the engine's index row holds neither. Leaving them
+    # in would make the oracle agree with this backend exactly where this
+    # backend disagrees with the engine.
+    for spec in meta["Fields"]:
+        if spec["FieldType"] in ("vector", "sparse_vector"):
+            validated.pop(spec["FieldName"], None)
     row: dict[str, Any] = processor.convert_fields_dict_for_index(validated)
     return row
 
@@ -1127,14 +1135,18 @@ def test_float_operand_against_int_column(
     assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expected
 
 
-def test_vectorless_row_scores_below_every_real_score(
+def test_vectorless_rows_rank_behind_every_vectored_row(
     adapter: PgVectorCollectionAdapter,
 ) -> None:
-    """The reported score must agree with the ordering.
+    """A row with no embedding ranks behind every row that has one.
 
-    Mapping a NULL score to 0.0 put an embedding-less row above any negative
-    real score, so a threshold check admitted it and dropped a genuine but
-    distant match.
+    Ordering uses two keys rather than folding a sentinel into the score. No
+    sentinel works: a value small enough to sit below every real score -- l2
+    distances overflow to infinity and ``ip`` reaches 2e38 -- also swamps the
+    sparse term, collapsing sparse-only rows to one indistinguishable score.
+
+    Scores are therefore monotonic *within* the vectored group; a vectorless
+    row's score is not comparable with them and is not claimed to be.
     """
     adapter.upsert(
         [
@@ -1144,10 +1156,69 @@ def test_vectorless_row_scores_below_every_real_score(
         ]
     )
     results = adapter.query(query_vector=[1.0] + [0.0] * (DIM - 1), limit=10)
-    scores = [r["_score"] for r in results]
-    assert scores == sorted(scores, reverse=True), results
-    assert results[-1]["id"] == "novec"
-    assert results[-1]["_score"] < results[-2]["_score"]
+
+    assert [r["id"] for r in results] == ["near", "far", "novec"]
+    vectored = [r["_score"] for r in results if r["id"] != "novec"]
+    assert vectored == sorted(vectored, reverse=True)
+
+
+def test_vectorless_rows_rank_behind_even_at_extreme_magnitudes(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """The ordering must not depend on the magnitude of real distances.
+
+    A sentinel-based ranking broke here: pgvector accumulates l2 in float4, so
+    a distance overflows to infinity at large element magnitudes and sorts
+    below any finite sentinel, putting the vectorless row first.
+    """
+    huge = [1e35] * DIM
+    adapter.upsert(
+        [
+            {"id": "novec"},
+            {"id": "huge", "vector": huge},
+            {"id": "zero", "vector": [0.0] * DIM},
+        ]
+    )
+    ranked = [r["id"] for r in adapter.query(query_vector=[-1e35] * DIM, limit=10)]
+    assert ranked[-1] == "novec", ranked
+
+
+def test_sparse_only_rows_stay_ordered_among_themselves(
+    dsn: str, test_schema: str
+) -> None:
+    """A sentinel folded into the score would collapse these to one value.
+
+    ``-1e30 + x == -1e30`` for any realistic sparse dot product, so both rows
+    scored identically and their relative order became arbitrary.
+    """
+    config = VectorDBBackendConfig(
+        backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+        name="context",
+        index_name="default",
+        distance_metric="cosine",
+        sparse_weight=1.0,
+        custom_params={"dsn": dsn, "schema": test_schema},
+    )
+    adapter = PgVectorCollectionAdapter.from_config(config)
+    adapter.create_collection(
+        "context", META, distance="cosine", sparse_weight=1.0, index_name="default"
+    )
+    try:
+        adapter.upsert(
+            [
+                {"id": "strong", "sparse_vector": {"7": 100.0}},
+                {"id": "weak", "sparse_vector": {"7": 1.0}},
+            ]
+        )
+        results = adapter.query(
+            query_vector=[1.0] + [0.0] * (DIM - 1),
+            sparse_query_vector={"7": 1.0},
+            limit=10,
+        )
+        assert [r["id"] for r in results] == ["strong", "weak"]
+        assert results[0]["_score"] > results[1]["_score"]
+    finally:
+        adapter.close()
 
 
 @pytest.mark.parametrize("bad", ["NaN", "Infinity", float("nan"), float("inf")])
@@ -1162,3 +1233,33 @@ def test_non_finite_numbers_are_rejected_on_write(
     """
     with pytest.raises(ValueError, match="NaN and infinity"):
         adapter.upsert({"id": "bad", "active_count": bad, "vector": vec(1)})
+
+
+def test_backfill_defaults_repairs_older_rows(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """Rows written before defaults existed are brought into line.
+
+    Defaults apply on write, so an upgraded database holds two populations
+    until this runs: a filter for ``level == 0`` would find the new rows and
+    miss the old ones.
+    """
+    adapter.upsert({"id": "new", "vector": vec(1)})
+
+    # Simulate a row from before defaults were applied.
+    collection = adapter.get_collection()
+    inner = collection._Collection__collection
+    inner._execute(
+        sql.SQL("INSERT INTO {}.{} (id, vector) VALUES (%s, %s::vector)").format(
+            sql.Identifier(inner._db_schema), sql.Identifier(inner._table)
+        ),
+        ("old", "[" + ",".join(["0.1"] * DIM) + "]"),
+    )
+    node = {"op": "must", "field": "level", "conds": [0]}
+    assert {r["id"] for r in adapter.query(filter=node, limit=10)} == {"new"}
+
+    assert inner.backfill_defaults() == 1
+    assert {r["id"] for r in adapter.query(filter=node, limit=10)} == {"new", "old"}
+
+    # Idempotent: a second run has nothing left to repair.
+    assert inner.backfill_defaults() == 0

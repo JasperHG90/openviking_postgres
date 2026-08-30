@@ -89,12 +89,16 @@ class FieldSpec:
         Whether this column is the collection's primary key.
     dim : int | None
         Declared dimension, set only for ``vector`` fields.
+    declared_default : object
+        The schema's own ``DefaultValue``, which the engine prefers over the
+        per-type default. ``None`` when the schema declares none.
     """
 
     name: str
     ov_type: str
     is_primary: bool = False
     dim: int | None = None
+    declared_default: object = None
 
     @property
     def is_vector(self) -> bool:
@@ -315,6 +319,7 @@ def _field_spec(raw_field: dict[str, Any]) -> FieldSpec | None:
         name=str(name),
         ov_type=ov_type,
         is_primary=bool(raw_field.get("IsPrimaryKey")),
+        declared_default=raw_field.get("DefaultValue"),
     )
 
 
@@ -381,9 +386,14 @@ def default_for(spec: FieldSpec) -> object:
     """
     if spec.is_primary or spec.is_vector:
         return None
+    if spec.declared_default is not None:
+        # The engine reads DefaultValue before falling back to TYPE_DEFAULTS.
+        return spec.declared_default
     # `convert_fields_dict_for_index` drops date_time and geo_point when their
-    # value is empty, so the engine index never sees the "" default for those.
-    if spec.ov_type in ("date_time", "geo_point"):
+    # value is empty, and `LocalCollection._write_data_list` pops the vector and
+    # sparse-vector keys outright, so the engine index never holds a default for
+    # any of them.
+    if spec.ov_type in ("date_time", "geo_point", "sparse_vector"):
         return None
     value = TYPE_DEFAULTS.get(spec.ov_type)
     return list(value) if isinstance(value, list) else value
