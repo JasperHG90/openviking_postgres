@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import math
-import re
 import threading
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, overload
@@ -62,6 +61,19 @@ DEFAULT_KEYWORD_FIELDS = ("name", "description", "abstract", "tags", "search_tag
 # Key for the NULL group in an aggregate. A column that is NULL and one that
 # holds "" are different groups, and folding them together lost one of them.
 NULL_BUCKET = "__ov_null__"
+
+# Marks an index comment as one of ours, so reconciliation can drop an index
+# this version no longer generates without touching anybody else's.
+_FINGERPRINT_PREFIX = "ov_postgres:"
+
+# Each keyword binds two parameters, one for ranking and one for matching, and
+# PostgreSQL allows 65535 per statement. Set below that limit rather than at
+# it, so the failure is a clear message instead of a driver error.
+_MAX_KEYWORD_TERMS = 16384
+
+# Planning cost is linear in the number of terms, roughly a millisecond each,
+# so a query this wide is worth saying something about.
+_KEYWORD_TERMS_WARN = 1024
 
 # Validators for a primary key value, by declared OpenViking type. These are
 # the same pydantic types the native engine validates every record against, so
@@ -193,6 +205,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         self._pgvector_version = pgvector_version
         self._index_name = index_name
         self._resolved_method: str | None = None
+        # Bumped whenever the indexes change, so a resolver whose catalog read
+        # was in flight can tell its answer is stale and drop it.
+        self._index_generation = 0
         self._closed = False
         self._lock = threading.RLock()
         self._compiler = FilterCompiler(
@@ -234,8 +249,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         Raises
         ------
-        TypeError
-            If the value is not a valid key of the declared type.
+        ValueError
+            If the value is not a valid key of the declared type. The engine
+            raises ``pydantic.ValidationError``, itself a ``ValueError``, so a
+            caller catching that behaves the same against either backend.
         """
         spec = self._schema.primary_key
         adapter = _KEY_ADAPTERS.get(spec.ov_type)
@@ -244,13 +261,44 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         try:
             return adapter.validate_python(value)
         except PydanticValidationError as exc:
-            raise TypeError(
+            raise ValueError(
                 f"primary key {spec.name!r} is declared {spec.ov_type!r}, "
                 f"but got {type(value).__name__}: {value!r}"
             ) from exc
 
-    def _coerce_keys(self, values: Iterable[object]) -> list[object]:
-        """Validate every key in ``values``; see :meth:`_coerce_key`.
+    def _lookup_key(self, value: object) -> object:
+        """Convert a key supplied to a *read* into what the column stores.
+
+        The engine validates writes but not reads: ``fetch_data``,
+        ``delete_data`` and the rest hash ``str(key)``, so
+        ``LocalCollection.fetch_data([7])`` finds the record stored under
+        ``"7"``. Refusing it here -- as the write path rightly does -- would
+        diverge in the other direction, so a read coerces instead.
+
+        Parameters
+        ----------
+        value :
+            A key from a caller's lookup list.
+
+        Returns
+        -------
+        object
+            The key as the column stores it.
+
+        Raises
+        ------
+        ValueError
+            If the value cannot be read as a key of the declared type at all.
+        """
+        spec = self._schema.primary_key
+        if spec.ov_type in ("string", "text", "path"):
+            if value is None:
+                raise ValueError(f"primary key {spec.name!r} cannot be None")
+            return str(value)
+        return self._coerce_key(value)
+
+    def _lookup_keys(self, values: Iterable[object]) -> list[object]:
+        """Convert every key in ``values`` for a read; see :meth:`_lookup_key`.
 
         Parameters
         ----------
@@ -260,14 +308,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         Returns
         -------
         list[object]
-            The validated keys, in the order given.
+            The keys as the column stores them, in the order given.
 
         Raises
         ------
-        TypeError
-            If any value is not a valid key of the declared type.
+        ValueError
+            If any value cannot be read as a key of the declared type.
         """
-        return [self._coerce_key(value) for value in values]
+        return [self._lookup_key(value) for value in values]
 
     def _check_open(self) -> None:
         """Raise if the collection has been closed."""
@@ -476,7 +524,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             self._text_search_config,
             taken,
         )
-        statements: list[Statement] = list(
+        statements: list[ddl.IndexStatement] = list(
             ddl.scalar_index_statements(self._db_schema, self._table, self._schema, taken)
         )
 
@@ -499,8 +547,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                for statement in statements:
-                    _execute_and_stamp(cur, self._db_schema, statement)
+                # Only an index this call actually built gets a fingerprint.
+                # `CREATE INDEX IF NOT EXISTS` silently skips one that is
+                # already there, and stamping regardless would mark a stale
+                # index as current -- after which reconciliation never looks at
+                # it again, because the fingerprint says it is fine.
+                present = self._existing_index_names(cur)
+                for entry in statements:
+                    cur.execute(entry.statement)
+                    if entry.name not in present:
+                        _stamp(cur, self._db_schema, entry)
                 # Record the method actually built, not the one requested:
                 # OpenViking always asks for `flat`/`flat_hybrid`, so a
                 # collection configured for hnsw would otherwise be recorded as
@@ -522,6 +578,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             self._distance = distance
             # The resolver reads pg_indexes; this call just changed them.
             self._resolved_method = None
+            self._index_generation += 1
         return _IndexHandle(index_name, meta_data)
 
     def has_index(self, index_name: str) -> bool:
@@ -708,7 +765,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # concurrent DELETE in that window would let a vectorless row
                 # through.
                 if vectorless:
-                    self._reject_new_vectorless(cur, vectorless)
+                    self._lock_rows_and_reject_new_vectorless(cur, ids, vectorless)
                 cur.executemany(self._upsert_statement(columns), rows)
         return UpsertDataResult(ids=ids)
 
@@ -796,7 +853,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # enough -- it made previously-safe mixed workloads deadlock.
                 # Sorted for lock ordering only; `updated` is re-ordered to
                 # match the caller's input below, as upsert_data does.
-                for record in sorted(data_list, key=lambda r: str(r.get(pk))):
+                for record in sorted(
+                    data_list, key=lambda r: _sort_key(self._coerce_key(r.get(pk)))
+                ):
                     if pk not in record:
                         raise ValueError(f"update_data record is missing {pk!r}")
                     key = self._coerce_key(record[pk])
@@ -866,7 +925,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         """
         if not primary_keys:
             return True
-        keys = self._coerce_keys(primary_keys)
+        keys = self._lookup_keys(primary_keys)
         pk = self._schema.primary_key.name
         self._execute(
             sql.SQL("DELETE FROM {} WHERE {} = ANY(%s)").format(
@@ -976,7 +1035,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         """
         if not primary_keys:
             return FetchDataInCollectionResult(items=[], ids_not_exist=[])
-        keys = self._coerce_keys(primary_keys)
+        keys = self._lookup_keys(primary_keys)
         pk = self._schema.primary_key.name
         # Every column, vectors included -- not the search projection.
         # `upsert_data` replaces the whole row, and OpenViking's read-modify-write
@@ -1107,7 +1166,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         vector_field = self._schema.vector_field
         if vector_field is None:
             raise ValueError("Collection has no vector field")
-        key = self._coerce_key(id)
+        key = self._lookup_key(id)
         pk = self._schema.primary_key.name
 
         row = self._execute(
@@ -1151,12 +1210,28 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         embedding model, so this is implemented rather than refused.
         """
         terms: list[str] = []
-        if keywords:
-            terms.extend(str(k) for k in keywords if str(k).strip())
-        if query and str(query).strip():
-            terms.append(str(query).strip())
+        seen_terms: set[str] = set()
+        # Deduplicated: each term costs two bound parameters and its own
+        # planning time, and repeating one changes nothing -- `a || a` is `a`.
+        for raw in [*(keywords or []), query or ""]:
+            text = str(raw).strip()
+            if text and text not in seen_terms:
+                seen_terms.add(text)
+                terms.append(text)
         if not terms:
             return SearchResult(data=[])
+        if len(terms) > _MAX_KEYWORD_TERMS:
+            raise ValueError(
+                f"search_by_keywords accepts at most {_MAX_KEYWORD_TERMS} distinct "
+                f"terms; got {len(terms)}. Each binds two parameters, and "
+                "PostgreSQL allows 65535 per statement."
+            )
+        if len(terms) > _KEYWORD_TERMS_WARN:
+            logger.warning(
+                "search_by_keywords: %d distinct terms; planning time grows "
+                "with the term count, roughly a millisecond each",
+                len(terms),
+            )
 
         specs = self._fulltext_specs()
         if not specs:
@@ -1529,6 +1604,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         the planner can use the index. Hybrid search cannot: the sparse term is
         not in any index, so it falls back to ordering by the combined score.
 
+        Every form ends with the primary key. Duplicate text is ordinary in a
+        memory store, and identical embeddings score identically: without a
+        tiebreaker a page boundary inside a run of equal distances returned
+        some rows twice and never returned others. The key is added *after*
+        the distance, so it becomes a presorted key and the planner still uses
+        the ANN index, adding only an incremental sort.
+
         Parameters
         ----------
         dense_vector :
@@ -1545,11 +1627,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         hybrid = bool(
             sparse_vector and self._schema.sparse_field and self._sparse_weight > 0
         )
+        pk = sql.Identifier(self._schema.primary_key.name)
         if dense_vector is not None and vector_field is not None and not hybrid:
             operator, _ = _DISTANCE[self._distance]
             return (
-                sql.SQL("{} {} {}::vector ASC").format(
-                    sql.Identifier(vector_field.name), operator, sql.Placeholder()
+                sql.SQL("{} {} {}::vector ASC, {}").format(
+                    sql.Identifier(vector_field.name), operator, sql.Placeholder(), pk
                 ),
                 [_format_vector(dense_vector)],
             )
@@ -1560,12 +1643,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # matches whose score is reported below theirs.
         if dense_vector is not None and vector_field is not None:
             return (
-                sql.SQL("({} IS NOT NULL) DESC, _score DESC NULLS LAST").format(
-                    sql.Identifier(vector_field.name)
+                sql.SQL("({} IS NOT NULL) DESC, _score DESC NULLS LAST, {}").format(
+                    sql.Identifier(vector_field.name), pk
                 ),
                 [],
             )
-        return sql.SQL("_score DESC NULLS LAST"), []
+        return sql.SQL("_score DESC NULLS LAST, {}").format(pk), []
 
     def _score_expression(
         self,
@@ -1683,6 +1766,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return self._index_method
         with self._lock:
             cached = self._resolved_method
+            generation = self._index_generation
         if cached is not None:
             return cached
 
@@ -1703,12 +1787,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 resolved = "ivfflat"
                 break
         with self._lock:
-            # A `create_index` that ran while the query above was in flight has
-            # already cleared the cache; its answer is the newer one, so do not
-            # overwrite it with this stale read.
-            if self._resolved_method is None:
+            # A `create_index` that ran while the query above was in flight
+            # bumped the generation, which makes this answer stale -- it
+            # described the indexes as they were before that call. Caching it
+            # would leave the scan setting unset for good, and filtered ANN
+            # searches silently returning fewer rows than asked for.
+            if self._index_generation == generation:
                 self._resolved_method = resolved
-            return self._resolved_method
+                return resolved
+        return self._resolved_index_method()
 
     def ensure_indexes(self) -> list[str]:
         """Bring the collection's indexes in line with what this version expects.
@@ -1730,9 +1817,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         far enough (function casing, added casts and parentheses) that no
         textual comparison survives.
 
-        An index this package did not create is left alone. Each rebuild takes
-        an ACCESS EXCLUSIVE lock for its duration, blocking readers as well as
-        writers, so run this during a quiet period on a large collection.
+        An index whose name this version would never generate is left alone,
+        as is one a constraint owns. An index *named* like ours but shaped
+        differently -- a hand-made partial index on `level`, say -- is treated
+        as an older version's and rebuilt, because there is no way to tell the
+        two apart once the fingerprint is missing. Name your own indexes
+        something else.
+
+        Each rebuild takes an ACCESS EXCLUSIVE lock for its duration, blocking
+        readers as well as writers, so run this during a quiet period on a
+        large collection.
 
         Returns
         -------
@@ -1779,19 +1873,35 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             or []
         }
 
+        # An index this version no longer generates but whose name it owns is
+        # dropped: with `keyword_fields` narrowed to nothing, the full-text
+        # index would otherwise be maintained on every write for ever while no
+        # query can reach it.
         changed: list[str] = []
         skipped: list[str] = []
         seen: set[str] = set()
-        for statement in wanted:
-            rendered = statement.as_string(None)
-            name = _index_name_of(rendered)
-            if name is None or name in seen:
+        for name, fingerprint in sorted(existing.items()):
+            if (
+                fingerprint is not None
+                and str(fingerprint).startswith(_FINGERPRINT_PREFIX)
+                and name not in {entry.name for entry in wanted}
+                and name not in constrained
+            ):
+                self._execute(
+                    sql.SQL("DROP INDEX {}.{}").format(
+                        sql.Identifier(self._db_schema), sql.Identifier(name)
+                    )
+                )
+                changed.append(name)
+        for entry in wanted:
+            name = entry.name
+            if name in seen:
                 # Two statements resolving to one name would otherwise flip the
                 # index back and forth on every call, rebuilding for ever.
                 continue
             seen.add(name)
 
-            fingerprint = _fingerprint(rendered)
+            fingerprint = _fingerprint(entry.statement.as_string(None))
             current = existing.get(name)
             if name in existing and current == fingerprint:
                 continue
@@ -1814,7 +1924,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                             sql.Identifier(self._db_schema), sql.Identifier(name)
                         )
                     )
-                _execute_and_stamp(cur, self._db_schema, statement)
+                # The name is free either way here -- just dropped, or never
+                # present -- so the CREATE cannot be skipped and the stamp
+                # describes what was actually built.
+                cur.execute(entry.statement)
+                _stamp(cur, self._db_schema, entry)
             changed.append(name)
 
         if skipped:
@@ -1828,7 +1942,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
         return sorted(set(changed))
 
-    def _reconcilable_index_statements(self) -> list[Statement]:
+    def _reconcilable_index_statements(self) -> list[ddl.IndexStatement]:
         """Return the scalar and full-text index statements for this collection.
 
         Names are assigned in the same order as ``create_index``, so a field
@@ -1841,8 +1955,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         Returns
         -------
-        list[Statement]
-            ``CREATE INDEX`` statements, full-text last.
+        list[ddl.IndexStatement]
+            ``CREATE INDEX`` statements with their names, full-text last.
         """
         taken: set[str] = set()
         fts = ddl.fulltext_index_statement(
@@ -1859,6 +1973,29 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             statements.append(fts)
         return statements
 
+    def _existing_index_names(self, cur: Cursor[Any]) -> set[str]:
+        """Return the names of indexes already on the table.
+
+        Parameters
+        ----------
+        cur :
+            Cursor to query on, so the answer is inside the caller's
+            transaction.
+
+        Returns
+        -------
+        set[str]
+            Index names present right now.
+        """
+        cur.execute(
+            sql.SQL(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = %s AND tablename = %s"
+            ),
+            (self._db_schema, self._table),
+        )
+        return {str(row[0]) for row in cur.fetchall()}
+
     def _expected_index_names(self) -> set[str]:
         """Return every index name this version would create.
 
@@ -1871,11 +2008,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         set[str]
             Index names this version generates for this collection.
         """
-        names = {
-            _index_name_of(st.as_string(None))
-            for st in self._reconcilable_index_statements()
-        }
-        return {n for n in names if n is not None}
+        return {entry.name for entry in self._reconcilable_index_statements()}
 
     def _fulltext_specs(self) -> list[FieldSpec]:
         """Return the schema fields backing keyword search.
@@ -2038,7 +2171,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
     def _replacement_rows(
         self, data_list: list[dict[str, Any]]
-    ) -> tuple[list[str], list[list[Any]], list[str], list[str]]:
+    ) -> tuple[list[str], list[list[Any]], list[object], set[object]]:
         """Build one uniform row per record for a replacing upsert.
 
         Every row binds the same column list -- every writable schema column
@@ -2054,9 +2187,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         Returns
         -------
-        tuple[list[str], list[list[Any]], list[str], list[str]]
-            The column list, one value row per record, the primary keys, and
-            the keys of records that arrived without an embedding.
+        tuple[list[str], list[list[Any]], list[object], set[object]]
+            The column list, one value row per record, the primary keys in
+            input order, and the keys of records that arrived without an
+            embedding.
 
         Raises
         ------
@@ -2087,8 +2221,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 defaults[spec.name] = self._adapt_value(spec, value)
 
         rows: list[list[Any]] = []
-        ids: list[str] = []
-        vectorless: list[str] = []
+        ids: list[object] = []
+        vectorless: set[object] = set()
         for record in data_list:
             names, values, extra = self._split_record(record)
             mapping: dict[str, Any] = dict(defaults)
@@ -2098,22 +2232,28 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 raise ValueError(f"upsert record is missing primary key {pk!r}")
             mapping[pk] = self._coerce_key(mapping[pk])
             if vector_field is not None and mapping.get(vector_field.name) is None:
-                vectorless.append(str(mapping[pk]))
-            ids.append(str(mapping[pk]))
+                vectorless.add(mapping[pk])
+            ids.append(mapping[pk])
             rows.append([mapping.get(name) for name in columns])
 
         # Sorted by primary key so concurrent batches touching the same rows
         # take their locks in the same order. Without it, two writers with
         # overlapping ids in opposite orders deadlock and PostgreSQL rolls one
-        # batch back entirely. `sorted` is stable, so the documented
-        # last-occurrence-wins behaviour for a repeated key is preserved.
-        # `ids` keeps input order, because the caller is told which keys were
-        # written, not in which order they hit the database.
-        rows = [row for _, row in sorted(zip(ids, rows, strict=True), key=lambda p: p[0])]
+        # batch back entirely. Sorting on the *coerced* key means an integer
+        # key sorts numerically, as its column does; sorting the string form
+        # would put 10 before 7 and reintroduce the mismatch. `sorted` is
+        # stable, so the documented last-occurrence-wins behaviour for a
+        # repeated key is preserved. `ids` keeps input order, because the
+        # caller is told which keys were written, not in which order they hit
+        # the database.
+        order = sorted(range(len(ids)), key=lambda i: _sort_key(ids[i]))
+        rows = [rows[i] for i in order]
         return columns, rows, ids, vectorless
 
-    def _reject_new_vectorless(self, cur: Cursor[Any], ids: list[str]) -> None:
-        """Refuse a *new* record with no embedding, but allow rewriting an old one.
+    def _lock_rows_and_reject_new_vectorless(
+        self, cur: Cursor[Any], ids: list[object], vectorless: set[object]
+    ) -> None:
+        """Lock every row about to be written, and refuse a *new* vectorless one.
 
         The engine's validator marks the vector Required, and pgvector's index
         builds skip NULL vectors, so a row without one is both impossible there
@@ -2124,30 +2264,38 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         way to repair them, so an existing row is allowed to be rewritten as it
         already is.
 
+        The lock covers the whole batch, not just the vectorless part of it.
+        Locking the subset was enough to answer the question but not to keep
+        the order: two writers whose vectorless subsets differ then claimed
+        the shared rows in incompatible orders and deadlocked.
+
+        Order matches the write order exactly -- ``_replacement_rows`` sorts on
+        the coerced key, so a text key sorts by code point (which the database
+        collation does not) and an integer key numerically.
+
         Parameters
         ----------
         cur :
             Cursor inside the writing transaction, so the check and the insert
             cannot be separated by a concurrent delete.
         ids :
-            Primary keys of records that arrived without an embedding.
+            Primary keys of every record in the batch.
+        vectorless :
+            Those among them that arrived without an embedding.
 
         Raises
         ------
         ValueError
-            If any of them names a row that does not already exist.
+            If a vectorless key names a row that does not already exist.
         """
         vector_field = self._schema.vector_field
         if vector_field is None:
             return
         pk = sql.Identifier(self._schema.primary_key.name)
-        # Locks must be taken in the same order as `_replacement_rows` and
-        # `update_data`, which sort with Python's sorted() -- code-point order.
-        # A bare ORDER BY uses the database collation instead, and on the stock
-        # image those disagree for ids such as `a_1` versus `a-b`, so the
-        # ordering added to prevent deadlocks produced them. COLLATE is only
-        # valid on a text type: applying it to a bigint key raises
-        # "collations are not supported by type bigint".
+        # COLLATE is only valid on a text type; on a bigint key it raises
+        # "collations are not supported by type bigint", and the bare column
+        # already orders numerically, which is what sorting the coerced key
+        # gives.
         ordered_pk: sql.Composable = pk
         if self._schema.primary_key.ov_type in ("string", "text", "path"):
             ordered_pk = sql.SQL('{} COLLATE "C"').format(pk)
@@ -2156,13 +2304,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 "SELECT {pk} FROM {table} WHERE {pk} = ANY(%s) "
                 "ORDER BY {ordered} FOR UPDATE"
             ).format(pk=pk, ordered=ordered_pk, table=self._qualified),
-            (sorted(ids),),
+            (sorted(ids, key=_sort_key),),
         )
-        existing = {str(row[0]) for row in cur.fetchall()}
-        new = [i for i in ids if i not in existing]
+        existing = {row[0] for row in cur.fetchall()}
+        new = [i for i in vectorless if i not in existing]
         if new:
+            listed = sorted(str(i) for i in new)[:5]
             raise ValueError(
-                f"record(s) {', '.join(sorted(new)[:5])!r} have no "
+                f"record(s) {', '.join(listed)!r} have no "
                 f"{vector_field.name!r}: an embedding is required, as the "
                 "built-in backend requires one"
             )
@@ -2274,53 +2423,31 @@ class _IndexHandle:
         return f"<PgVectorIndex {self.name!r}>"
 
 
-_INDEX_NAME_RE = re.compile(r'CREATE INDEX(?: IF NOT EXISTS)? "([^"]+)"')
+def _sort_key(value: object) -> tuple[int, Any]:
+    """Return a total ordering key for a primary key value.
 
-
-def _index_name_of(statement: str) -> str | None:
-    """Extract the index name from a rendered CREATE INDEX statement.
+    Keys are homogeneous once coerced, so the type tag only guards against a
+    schema this package does not validate. Within a type the natural order
+    applies: code-point order for text, numeric for integers. Sorting the
+    string form of an integer key would put ``10`` before ``7`` and disagree
+    with the column's own ordering, which is how the writes and their row
+    locks came to be taken in different orders.
 
     Parameters
     ----------
-    statement :
-        A rendered ``CREATE INDEX`` statement.
+    value :
+        A coerced primary key.
 
     Returns
     -------
-    str | None
-        The index name, or ``None`` if the statement is not a CREATE INDEX.
+    tuple[int, Any]
+        A key safe to pass to ``sorted``.
     """
-    match = _INDEX_NAME_RE.search(statement)
-    return match.group(1) if match else None
-
-
-def _execute_and_stamp(cur: Cursor[Any], db_schema: str, statement: Statement) -> None:
-    """Run a ``CREATE INDEX`` statement and record its fingerprint on the index.
-
-    The comment is what lets ``ensure_indexes`` tell an index built by this
-    version from one built by an older one, or by somebody else.
-
-    Parameters
-    ----------
-    cur :
-        Open cursor to run both statements on.
-    db_schema :
-        Schema holding the index.
-    statement :
-        The ``CREATE INDEX`` statement to run.
-    """
-    cur.execute(statement)
-    rendered = statement.as_string(None)
-    name = _index_name_of(rendered)
-    if name is None:
-        return
-    cur.execute(
-        sql.SQL("COMMENT ON INDEX {}.{} IS {}").format(
-            sql.Identifier(db_schema),
-            sql.Identifier(name),
-            sql.Literal(_fingerprint(rendered)),
-        )
-    )
+    if isinstance(value, str):
+        return (0, value)
+    if isinstance(value, (int, float)):
+        return (1, value)
+    return (2, str(value))
 
 
 def _balanced_or(parts: list[sql.Composable]) -> sql.Composable:
@@ -2334,18 +2461,50 @@ def _balanced_or(parts: list[sql.Composable]) -> sql.Composable:
     Parameters
     ----------
     parts :
-        Fragments to OR together; must not be empty.
+        Fragments to OR together.
 
     Returns
     -------
     sql.Composable
         A single parenthesised expression.
+
+    Raises
+    ------
+    ValueError
+        If ``parts`` is empty; there is no identity to return.
     """
+    if not parts:
+        raise ValueError("_balanced_or needs at least one fragment")
     if len(parts) == 1:
         return sql.SQL("({})").format(parts[0])
     middle = len(parts) // 2
     return sql.SQL("({} || {})").format(
         _balanced_or(parts[:middle]), _balanced_or(parts[middle:])
+    )
+
+
+def _stamp(cur: Cursor[Any], db_schema: str, entry: ddl.IndexStatement) -> None:
+    """Record on an index the fingerprint of the statement that built it.
+
+    The comment is what lets ``ensure_indexes`` tell an index built by this
+    version from one built by an older one, or by somebody else. Call it only
+    for an index this process actually created.
+
+    Parameters
+    ----------
+    cur :
+        Open cursor, inside the transaction that created the index.
+    db_schema :
+        Schema holding the index.
+    entry :
+        The statement and the name it created.
+    """
+    cur.execute(
+        sql.SQL("COMMENT ON INDEX {}.{} IS {}").format(
+            sql.Identifier(db_schema),
+            sql.Identifier(entry.name),
+            sql.Literal(_fingerprint(entry.statement.as_string(None))),
+        )
     )
 
 
@@ -2368,7 +2527,7 @@ def _fingerprint(statement: str) -> str:
         A short, prefixed digest.
     """
     digest = hashlib.sha256(" ".join(statement.split()).encode("utf-8")).hexdigest()
-    return f"ov_postgres:{digest[:16]}"
+    return f"{_FINGERPRINT_PREFIX}{digest[:16]}"
 
 
 def _format_vector(value: object) -> str:

@@ -2251,16 +2251,19 @@ def test_a_mistyped_key_is_refused_like_the_reference(dsn: str, test_schema: str
     adapter = build(dsn, test_schema)
     try:
         collection = adapter.get_collection()
-        with pytest.raises(TypeError, match="declared 'string'"):
+        with pytest.raises(ValueError, match="declared 'string'"):
             adapter.upsert({"id": 3, "level": 1, "vector": vec(1)})
-        with pytest.raises(TypeError, match="declared 'string'"):
-            adapter.get([3])
-        with pytest.raises(TypeError, match="declared 'string'"):
-            adapter.delete(ids=[3])
-        with pytest.raises(TypeError, match="declared 'string'"):
+        with pytest.raises(ValueError, match="declared 'string'"):
             collection.update_data([{"id": 3, "level": 2}])
-        with pytest.raises(TypeError, match="declared 'string'"):
-            collection.search_by_id("default", 3)
+        assert adapter.count() == 0
+
+        # Reads are lenient, because the engine's are: `fetch_data` and
+        # `delete_data` hash `str(key)`, so an integer finds the record stored
+        # under its string form rather than raising.
+        adapter.upsert({"id": "3", "level": 1, "vector": vec(1)})
+        assert [r["id"] for r in adapter.get([3])] == ["3"]
+        assert collection.search_by_id("default", 3).data == []
+        assert adapter.delete(ids=[3]) == 1
         assert adapter.count() == 0
     finally:
         adapter.close()
@@ -2583,5 +2586,266 @@ def test_the_index_method_cache_is_cleared_by_a_rebuild(
         )
         assert collection._resolved_method is None
         assert collection._resolved_index_method() == "hnsw"
+    finally:
+        adapter.close()
+
+
+def test_concurrent_int_key_upserts_do_not_deadlock(dsn: str, test_schema: str) -> None:
+    """An integer key must lock rows in numeric order, as its column sorts.
+
+    The write order came from ``str(key)``, which puts ``10`` before ``7``,
+    while the lock query's ``ORDER BY`` on a bigint column is numeric. The two
+    disagreed for any key set spanning a digit-count boundary.
+    """
+    keys = [7, 8, 9, 10, 11, 12]
+    adapter = build(dsn, test_schema, meta=int_key_meta())
+    try:
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in keys])
+        errors: list[BaseException] = []
+
+        def churn(seed: int, *, with_vectors: bool) -> None:
+            batch: list[dict[str, Any]] = [{"id": k, "level": seed} for k in keys]
+            if with_vectors:
+                for record in batch:
+                    record["vector"] = vec(1)
+            try:
+                for _ in range(40):
+                    adapter.upsert(batch)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=churn, args=(n,), kwargs={"with_vectors": n % 2 == 0})
+            for n in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == [], errors[0]
+    finally:
+        adapter.close()
+
+
+def test_writers_with_different_vectorless_subsets_do_not_deadlock(
+    dsn: str, test_schema: str
+) -> None:
+    """The pre-write lock must cover the whole batch, not part of it.
+
+    Locking only the records that arrived without an embedding answers the
+    question it was asked, but leaves two writers whose vectorless subsets
+    differ claiming the shared rows in incompatible orders.
+    """
+    keys = ["k0", "k1", "k2", "k3", "k4", "k5"]
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert([{"id": k, "level": 0, "vector": vec(1)} for k in keys])
+        errors: list[BaseException] = []
+
+        def churn(seed: int, *, omit: set[str]) -> None:
+            batch: list[dict[str, Any]] = []
+            for key in keys:
+                record: dict[str, Any] = {"id": key, "level": seed}
+                if key not in omit:
+                    record["vector"] = vec(1)
+                batch.append(record)
+            try:
+                for _ in range(60):
+                    adapter.upsert(batch)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=churn,
+                args=(n,),
+                kwargs={"omit": {"k4", "k5"} if n % 2 else {"k0", "k1"}},
+            )
+            for n in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == [], errors[0]
+    finally:
+        adapter.close()
+
+
+def test_a_stale_resolver_read_does_not_overwrite_a_newer_answer(
+    dsn: str, test_schema: str
+) -> None:
+    """A cached index method must not outlive the indexes it described.
+
+    Clearing the cache is not enough on its own: a resolver that read
+    ``pg_indexes`` before a rebuild and wrote after it found the cache empty
+    -- exactly the post-clear state -- and reinstated its stale answer for
+    good. The scan setting is then never emitted and a filtered ANN search
+    silently returns fewer rows than asked for.
+
+    The rebuild is injected into the resolver's own catalog query, so the
+    interleaving under test happens for real rather than being described.
+    """
+    adapter = build(dsn, test_schema, index_method="auto")
+    try:
+        collection = cast(Any, adapter.get_collection())._Collection__collection
+        assert collection._resolved_index_method() == "flat"
+        with collection._lock:
+            collection._resolved_method = None
+
+        original = collection._execute
+        injected: list[bool] = []
+
+        def execute_then_rebuild(statement: Any, *args: Any, **kwargs: Any) -> Any:
+            rows = original(statement, *args, **kwargs)
+            if not injected and "indexdef" in statement.as_string(None):
+                # The resolver has its answer -- `flat` -- and has not cached
+                # it yet. The rebuild lands in that window.
+                injected.append(True)
+                collection.create_index(
+                    "default",
+                    {"VectorIndex": {"Distance": "cosine", "IndexType": "hnsw"}},
+                )
+            return rows
+
+        collection._execute = execute_then_rebuild
+        try:
+            assert collection._resolved_index_method() == "hnsw"
+        finally:
+            collection._execute = original
+        assert injected == [True]
+        assert collection._resolved_index_method() == "hnsw"
+    finally:
+        adapter.close()
+
+
+def test_a_quoted_field_name_survives_collection_creation(
+    dsn: str, test_schema: str
+) -> None:
+    """A field name containing a quote must not break index bookkeeping.
+
+    psycopg doubles a quote inside an identifier, so reading the index name
+    back out of the rendered statement stopped at the doubled quote and the
+    follow-up ``COMMENT ON INDEX`` addressed a table that does not exist.
+    """
+    meta = copy.deepcopy(META)
+    meta["Fields"].append({"FieldName": 'we"ird', "FieldType": "string"})
+    meta["ScalarIndex"].append('we"ird')
+    adapter = build(dsn, test_schema, meta=meta)
+    try:
+        assert 'ov_context__we"ird_idx' in indexes_on(dsn, test_schema)
+        assert adapter.ensure_indexes() == []
+        adapter.upsert({"id": "a", 'we"ird': "x", "vector": vec(1)})
+        assert adapter.get(["a"])[0]['we"ird'] == "x"
+    finally:
+        adapter.close()
+
+
+def test_vector_paging_is_stable_when_distances_tie(dsn: str, test_schema: str) -> None:
+    """Identical embeddings must not make a page boundary lose rows.
+
+    Duplicate text is ordinary in a memory store, and identical embeddings
+    score identically. Without a tiebreaker the run of equal distances may be
+    ordered differently per query, so paging repeats some rows and skips
+    others.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert(
+            [{"id": f"r{n:04d}", "level": n, "vector": vec(1)} for n in range(300)]
+        )
+        collection = adapter.get_collection()
+        seen: list[str] = []
+        for page in range(6):
+            result = collection.search_by_vector(
+                "default", dense_vector=vec(1), limit=50, offset=page * 50
+            )
+            seen.extend(str(item.id) for item in result.data)
+        assert len(seen) == 300
+        assert len(set(seen)) == 300
+    finally:
+        adapter.close()
+
+
+def test_create_index_does_not_stamp_an_index_it_skipped(
+    dsn: str, test_schema: str
+) -> None:
+    """A fingerprint must describe the index that is there, not the one asked for.
+
+    ``CREATE INDEX IF NOT EXISTS`` silently skips an existing name. Stamping
+    regardless marks a stale index as current, and reconciliation then never
+    looks at it again.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "name": "running", "vector": vec(1)})
+    finally:
+        adapter.close()
+
+    adapter = build_existing(dsn, test_schema, text_search_config="english")
+    try:
+        collection = cast(Any, adapter.get_collection())._Collection__collection
+        collection.create_index("default", {})
+        # The index is still the `simple` one, so reconciliation must still
+        # see it as out of date.
+        assert "'simple'" in indexes_on(dsn, test_schema)["ov_context__fts_idx"]
+        assert adapter.ensure_indexes() == ["ov_context__fts_idx"]
+        assert "'english'" in indexes_on(dsn, test_schema)["ov_context__fts_idx"]
+    finally:
+        adapter.close()
+
+
+def test_ensure_indexes_drops_a_full_text_index_it_no_longer_wants(
+    dsn: str, test_schema: str
+) -> None:
+    """Narrowing ``keyword_fields`` to nothing must retire the index.
+
+    Left in place it is rebuilt on every write while no query can reach it --
+    `search_by_keywords` reports no text fields and returns nothing.
+    """
+    adapter = build(dsn, test_schema)
+    try:
+        assert "ov_context__fts_idx" in indexes_on(dsn, test_schema)
+    finally:
+        adapter.close()
+
+    adapter = build_existing(dsn, test_schema, keyword_fields=["level"])
+    try:
+        assert adapter.ensure_indexes() == ["ov_context__fts_idx"]
+        assert "ov_context__fts_idx" not in indexes_on(dsn, test_schema)
+        assert adapter.ensure_indexes() == []
+    finally:
+        adapter.close()
+
+
+def test_too_many_keywords_is_reported_not_hit(dsn: str, test_schema: str) -> None:
+    """Past the parameter limit the caller gets a message, not a driver error."""
+    adapter = build(dsn, test_schema)
+    try:
+        adapter.upsert({"id": "a", "name": "needle", "vector": vec(1)})
+        collection = adapter.get_collection()
+        with pytest.raises(ValueError, match="at most 16384 distinct terms"):
+            collection.search_by_keywords(
+                "default", keywords=[f"t{n}" for n in range(20000)]
+            )
+        # Repeats cost parameters and change nothing, so they are collapsed.
+        result = collection.search_by_keywords(
+            "default", keywords=["needle"] * 30000, limit=5
+        )
+        assert [str(item.id) for item in result.data] == ["a"]
+    finally:
+        adapter.close()
+
+
+def test_upsert_and_update_report_keys_the_same_way(dsn: str, test_schema: str) -> None:
+    """Both must return the key as stored, as the engine's validator does."""
+    adapter = build(dsn, test_schema, meta=int_key_meta())
+    try:
+        collection = adapter.get_collection()
+        assert collection.upsert_data([{"id": 10, "level": 1, "vector": vec(1)}]).ids == [
+            10
+        ]
+        assert collection.update_data([{"id": 10, "level": 2}]).ids == [10]
+        assert [r["id"] for r in adapter.get([10])] == [10]
     finally:
         adapter.close()

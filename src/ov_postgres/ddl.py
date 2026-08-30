@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, NamedTuple
 
 from psycopg import sql
 
@@ -11,6 +11,27 @@ from .schema import CollectionSchema, FieldSpec
 
 # What psycopg's execute() accepts.
 Statement = sql.SQL | sql.Composed
+
+
+class IndexStatement(NamedTuple):
+    """A ``CREATE INDEX`` statement paired with the name it creates.
+
+    The name travels with the statement rather than being read back out of the
+    rendered SQL: psycopg doubles a quote inside an identifier, so a field
+    named ``we"ird`` parsed back as ``ov_context__we`` and the follow-up
+    ``COMMENT ON INDEX`` failed against a table that does not exist.
+
+    Attributes
+    ----------
+    name : str
+        The index name, exactly as PostgreSQL will store it.
+    statement : Statement
+        The statement that creates it.
+    """
+
+    name: str
+    statement: Statement
+
 
 # Registry tables track collection and index metadata so that
 # ``get_meta_data`` / ``list_indexes`` return exactly what was declared.
@@ -405,7 +426,7 @@ def create_table(schema_name: str, table: str, coll: CollectionSchema) -> Statem
 
 def scalar_index_statements(
     schema_name: str, table: str, coll: CollectionSchema, taken: set[str] | None = None
-) -> list[Statement]:
+) -> list[IndexStatement]:
     """Build an index for every field named in ``ScalarIndex``.
 
     Array fields get a GIN index; everything else gets a B-tree. Path fields
@@ -424,10 +445,10 @@ def scalar_index_statements(
 
     Returns
     -------
-    list[Statement]
-        Idempotent ``CREATE INDEX`` statements.
+    list[IndexStatement]
+        Idempotent ``CREATE INDEX`` statements, each with its index name.
     """
-    statements: list[Statement] = []
+    statements: list[IndexStatement] = []
     for name in coll.scalar_index:
         spec = coll.by_name(name)
         if spec is None or spec.is_vector or spec.is_sparse or spec.is_geo:
@@ -435,12 +456,15 @@ def scalar_index_statements(
         plain_name = index_name(table, name, "idx", taken=taken)
         method = sql.SQL("gin") if spec.is_array else sql.SQL("btree")
         statements.append(
-            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({})").format(
-                sql.Identifier(plain_name),
-                sql.Identifier(schema_name),
-                sql.Identifier(table),
-                method,
-                sql.Identifier(name),
+            IndexStatement(
+                plain_name,
+                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({})").format(
+                    sql.Identifier(plain_name),
+                    sql.Identifier(schema_name),
+                    sql.Identifier(table),
+                    method,
+                    sql.Identifier(name),
+                ),
             )
         )
         # A *second*, collated index for range comparisons, which run under
@@ -449,25 +473,35 @@ def scalar_index_statements(
         # serve a bare `col = ANY(...)`; replacing the plain one turned every
         # equality filter -- by far the commonest shape -- into a seq scan.
         if spec.is_textual and not spec.is_array:
+            collated = index_name(table, name, "c_idx", taken=taken)
             statements.append(
-                sql.SQL('CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} COLLATE "C")').format(
-                    sql.Identifier(index_name(table, name, "c_idx", taken=taken)),
-                    sql.Identifier(schema_name),
-                    sql.Identifier(table),
-                    sql.Identifier(name),
+                IndexStatement(
+                    collated,
+                    sql.SQL(
+                        'CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} COLLATE "C")'
+                    ).format(
+                        sql.Identifier(collated),
+                        sql.Identifier(schema_name),
+                        sql.Identifier(table),
+                        sql.Identifier(name),
+                    ),
                 )
             )
         # Path fields are also queried by prefix; a text_pattern_ops index lets
         # `LIKE 'prefix%'` use an index instead of scanning.
         if spec.is_path:
+            prefix = index_name(table, name, "prefix_idx", taken=taken)
             statements.append(
-                sql.SQL(
-                    "CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} text_pattern_ops)"
-                ).format(
-                    sql.Identifier(index_name(table, name, "prefix_idx", taken=taken)),
-                    sql.Identifier(schema_name),
-                    sql.Identifier(table),
-                    sql.Identifier(name),
+                IndexStatement(
+                    prefix,
+                    sql.SQL(
+                        "CREATE INDEX IF NOT EXISTS {} ON {}.{} ({} text_pattern_ops)"
+                    ).format(
+                        sql.Identifier(prefix),
+                        sql.Identifier(schema_name),
+                        sql.Identifier(table),
+                        sql.Identifier(name),
+                    ),
                 )
             )
     return statements
@@ -496,7 +530,7 @@ def vector_index_statement(
     method: str,
     options: dict[str, Any] | None = None,
     taken: set[str] | None = None,
-) -> Statement | None:
+) -> IndexStatement | None:
     """Build the ANN index statement, or ``None`` for exact search.
 
     pgvector has no "flat" index type -- omitting the index *is* exact search,
@@ -519,8 +553,9 @@ def vector_index_statement(
 
     Returns
     -------
-    Statement | None
-        The statement, or ``None`` when ``method`` asks for exact search.
+    IndexStatement | None
+        The statement and its index name, or ``None`` when ``method`` asks for
+        exact search.
 
     Raises
     ------
@@ -543,8 +578,11 @@ def vector_index_statement(
             f"Expected 'flat', or one of: {', '.join(sorted(_ANN_METHODS))}"
         )
 
-    statement = sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({} {})").format(
-        sql.Identifier(index_name(table, spec.name, method, "idx", taken=taken)),
+    name = index_name(table, spec.name, method, "idx", taken=taken)
+    statement: Statement = sql.SQL(
+        "CREATE INDEX IF NOT EXISTS {} ON {}.{} USING {} ({} {})"
+    ).format(
+        sql.Identifier(name),
         sql.Identifier(schema_name),
         sql.Identifier(table),
         ann_method,
@@ -557,7 +595,7 @@ def vector_index_statement(
             for key, value in options.items()
         )
         statement = sql.SQL("{} WITH ({})").format(statement, rendered)
-    return statement
+    return IndexStatement(name, statement)
 
 
 def fulltext_index_statement(
@@ -566,7 +604,7 @@ def fulltext_index_statement(
     specs: list[FieldSpec],
     regconfig: str,
     taken: set[str] | None = None,
-) -> Statement | None:
+) -> IndexStatement | None:
     """Build the GIN index backing keyword search.
 
     Parameters
@@ -584,16 +622,21 @@ def fulltext_index_statement(
 
     Returns
     -------
-    Statement | None
-        The statement, or ``None`` when no text columns are available.
+    IndexStatement | None
+        The statement and its index name, or ``None`` when no text columns are
+        available.
     """
     if not specs:
         return None
-    return sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING gin ({})").format(
-        sql.Identifier(index_name(table, "fts_idx", taken=taken)),
-        sql.Identifier(schema_name),
-        sql.Identifier(table),
-        tsvector_expr(specs, regconfig, schema_name),
+    name = index_name(table, "fts_idx", taken=taken)
+    return IndexStatement(
+        name,
+        sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING gin ({})").format(
+            sql.Identifier(name),
+            sql.Identifier(schema_name),
+            sql.Identifier(table),
+            tsvector_expr(specs, regconfig, schema_name),
+        ),
     )
 
 

@@ -350,7 +350,8 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 - **`search_by_multimodal`** raises `NotImplementedError`: it requires an embedding model this layer does not have.
 - **`geo_range`** filters raise `UnsupportedFilterError`. Geo points are stored and read back, but are not queryable by radius.
 - **TTL** on `upsert_data` is ignored, with a warning.
-- **A primary key of the wrong type is refused**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`.
+- **A primary key of the wrong type is refused on write**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`. Reads are lenient, again matching: `fetch_data([3])` finds the record stored under `"3"`.
+- **`search_by_keywords` takes at most 16384 distinct terms.** Each binds two parameters against PostgreSQL's limit of 65535, and planning costs roughly a millisecond per term. Repeated terms are collapsed before any of that.
 - **Server-side grep** never routes here. OpenViking's `_resolve_grep_engine` hard-codes `("volcengine", "vikingdb")`, so grep falls back to the filesystem and the `content` field is not stored.
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
@@ -401,8 +402,14 @@ adapter.close()
 
 Each index carries a fingerprint of the statement that built it, recorded as a
 comment on the index, so `ensure_indexes` can tell an index this package
-created from one you added yourself. Yours is left alone, as is any index a
-constraint owns. Changing `text_search_config` or `keyword_fields` re-keys the
+created from one you added yourself. An index a constraint owns is left alone,
+and so is one whose name this package would never generate — **give your own
+indexes names of your own**. An index named like ours but shaped differently
+is treated as an older version's and rebuilt, because once the fingerprint is
+missing the two are indistinguishable. An index this version no longer wants
+but whose name it owns is dropped: narrowing `keyword_fields` to nothing
+retires the full-text index rather than leaving it to be maintained on every
+write while no query can reach it. Changing `text_search_config` or `keyword_fields` re-keys the
 full-text index, which is the one case where skipping the repair leaves
 keyword search scanning the whole table.
 
