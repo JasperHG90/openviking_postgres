@@ -24,7 +24,7 @@ You need a PostgreSQL 13+ database with [pgvector](https://github.com/pgvector/p
 Install into the environment that runs OpenViking:
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@main"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@v0.2.0"
 ```
 
 Here is a complete `~/.openviking/ov.conf` that runs on Postgres. Copy it whole, change the DSN, and you are done:
@@ -100,10 +100,10 @@ From the main branch:
 uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@main"
 ```
 
-Pin to a commit for a reproducible install:
+Pin to a release for a reproducible install:
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@a81c0de6b2e6"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@v0.2.0"
 ```
 
 If OpenViking runs from a virtualenv you manage by hand rather than a `uv` project:
@@ -113,9 +113,9 @@ uv pip install --python /path/to/openviking/.venv/bin/python \
   "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@main"
 ```
 
-There is no tagged release yet, so a `@v0.1.0` reference or a
-`releases/download/...` wheel URL will not resolve. Once a release is cut,
-either form works and is preferable to pinning a commit.
+`v0.2.0` is the current release, and pinning it is preferable to pinning a
+commit: history was rewritten once to drop a file that should never have been
+committed, so older SHAs no longer resolve.
 
 Confirm it landed where OpenViking will find it:
 
