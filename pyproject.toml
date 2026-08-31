@@ -112,6 +112,14 @@ warn_unreachable = true
 files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
+# hatch-vcs writes `_version.py` at build time, so it is absent from a fresh
+# checkout. `__init__` already falls back to importlib.metadata when the import
+# fails; without this the type check passes locally, where an editable install
+# has generated the file, and fails in CI, where nothing has.
+module = ["ov_postgres._version"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 # OpenViking ships no type information, so its symbols arrive as Any.
 # numpy is a transitive dependency this package never calls; its bundled stubs
 # use 3.12-only `type` statements, which would fail a 3.10-targeted check.
