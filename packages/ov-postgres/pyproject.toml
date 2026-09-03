@@ -115,6 +115,13 @@ plugins = ["pydantic.mypy"]
 strict = true
 warn_unreachable = true
 files = ["src", "tests"]
+# Without this, a pre-commit run whose changed files are tests only cannot
+# resolve `ov_postgres`: the hook's isolated env has no editable install, and
+# no src file is on the command line to map the package from. Entries resolve
+# against the CWD, not this file, so both invocation points are listed -- the
+# repo root (pre-commit) and this directory (uv run --directory). The entry
+# that does not exist for a given CWD is inert.
+mypy_path = ["packages/ov-postgres/src", "src"]
 
 [[tool.mypy.overrides]]
 # hatch-vcs writes `_version.py` at build time, so it is absent from a fresh
