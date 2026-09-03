@@ -1,0 +1,69 @@
+# Test and build one package. Lint, format and types run once repo-wide in
+# ci.yaml's checks job.
+name: template-check
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: "Directory name under packages/, e.g. ov-postgres. Also the distribution name."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: '0.10.x'
+
+jobs:
+  check:
+    name: ${{ inputs.package }} / py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor from requires-python and the version the tools pin.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # hatch-vcs needs history and tags to resolve a version when uv
+          # builds the editable install.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install workspace
+        # --locked fails if uv.lock has drifted from any member's pyproject.toml.
+        run: uv sync --locked --all-packages --python ${{ matrix.python-version }}
+
+      - name: Run unit tests
+        run: uv run --no-sync --directory packages/${{ inputs.package }} pytest -v -m "not integration" --color=yes --tb=short
+
+      # Integration suites may start containers through testcontainers.
+      # ubuntu-latest ships a running Docker daemon, so no service container is
+      # needed; a suite skips itself if it needs one and none is present.
+      - name: Run integration tests
+        run: uv run --no-sync --directory packages/${{ inputs.package }} pytest -v -m "integration" --color=yes --tb=short
+
+      - name: Build sdist and wheel
+        run: uv build --package ${{ inputs.package }}
+
+      # Install with its real dependencies: a --no-deps check would fail on the
+      # first import of a dependency. The import name is the distribution name
+      # with dashes as underscores; packages here follow that convention.
+      - name: Check the wheel installs and imports on its own
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          uv venv /tmp/wheelcheck
+          uv pip install --python /tmp/wheelcheck/bin/python dist/*.whl
+          module="${PACKAGE//-/_}"
+          /tmp/wheelcheck/bin/python -c "import ${module}; print(${module}.__version__)"

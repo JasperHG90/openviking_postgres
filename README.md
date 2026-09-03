@@ -32,9 +32,13 @@ To work on one package, run commands scoped to it:
 uv run --directory packages/ov-postgres pytest
 ```
 
+## CI
+
+One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide checks run once, then [`template-check.yaml`](.github/workflows/template-check.yaml) tests and builds each package whose files changed. Adding a package means adding one filter block and one name to `ci.yaml`, and its directory to the workspace members in [`pyproject.toml`](pyproject.toml).
+
 ## Releases
 
-Each package releases on its own tag: `<package>-v<version>`, e.g. `ov-postgres-v0.3.0`. Pushing such a tag builds that package and publishes a GitHub release carrying its artifacts.
+Each package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package, pick the version increment — `auto` derives it from conventional commits since the package's last tag — and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. Nothing releases on push.
 
 ## License
 

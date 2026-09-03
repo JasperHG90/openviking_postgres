@@ -1,0 +1,208 @@
+# Release one package. Manual only; nothing on main triggers this.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package to release."
+        type: choice
+        required: true
+        options:
+          - ov-postgres
+      increment:
+        description: "auto derives the bump from conventional commits since the last tag."
+        type: choice
+        required: true
+        default: auto
+        options: [auto, PATCH, MINOR, MAJOR]
+      dry_run:
+        description: "Print the plan without tagging or publishing."
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+# Never release the same package twice at once, and never cancel one part way.
+concurrency:
+  group: release-${{ inputs.package }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: '0.10.x'
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to release off main
+        if: ${{ github.ref != 'refs/heads/main' }}
+        # Via env, since a ref name can legally contain shell metacharacters.
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Release must run from main, got $REF."
+          exit 1
+
+  # Gates the tag: nothing gets tagged that does not pass its own checks.
+  test:
+    needs: guard
+    uses: ./.github/workflows/template-check.yaml
+    with:
+      package: ${{ inputs.package }}
+
+  release:
+    name: plan and tag
+    needs: [guard, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # commitizen reads tags and the commit log
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Work out the version
+        id: plan
+        env:
+          PACKAGE: ${{ inputs.package }}
+          INCREMENT: ${{ inputs.increment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Generated: every value is constant or derived from $PACKAGE. The
+          # tag format matches hatch-vcs's --match in the package's pyproject.
+          CFG="$RUNNER_TEMP/cz-$PACKAGE.toml"
+          printf '[tool.commitizen]\nname = "cz_conventional_commits"\nversion_provider = "scm"\ntag_format = "%s-v$version"\n' \
+            "$PACKAGE" > "$CFG"
+
+          # --yes: without a matching tag yet, cz would prompt and die on no tty.
+          ARGS=(--config "$CFG" bump --get-next --yes)
+          if [ "$INCREMENT" != "auto" ]; then
+            ARGS+=(--increment "$INCREMENT")
+          fi
+          # `if ! cmd` would leave $? as the inverted status, so capture it directly.
+          set +e
+          VERSION=$(uvx --from commitizen==4.8.3 cz "${ARGS[@]}" | tail -n1 | tr -d '[:space:]')
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            # 3 and 21 mean nothing to release; anything else is a config problem.
+            case "$rc" in
+              3|21)
+                echo "::error::No commits eligible for a bump since the last $PACKAGE tag."
+                echo "::error::Re-run with an explicit increment if you still want to release."
+                ;;
+              *)
+                echo "::error::commitizen exited $rc. See its output above."
+                echo "::error::That is a config problem, not a missing increment."
+                ;;
+            esac
+            exit 1
+          fi
+
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Could not parse a version, got '$VERSION'."
+            exit 1
+          fi
+
+          # Same shape as the generated tag_format, from the same variable.
+          TAG="$PACKAGE-v$VERSION"
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists."
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## ${{ steps.plan.outputs.tag }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| package | \`${{ inputs.package }}\` |"
+            echo "| version | \`${{ steps.plan.outputs.version }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| dry run | ${{ inputs.dry_run }} |"
+            echo
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "Dry run. Nothing was tagged or published."
+              echo "Re-run with **dry_run** unchecked to cut this release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "refs/tags/$TAG"
+
+  # Chained via needs: a tag pushed with GITHUB_TOKEN does not trigger
+  # workflows. Publishing after tagging means a release only appears with its
+  # artifacts attached; if the build fails the tag stands and a re-run of this
+  # workflow is not needed -- build locally from the tag and attach by hand,
+  # or delete the tag and start over.
+  publish:
+    name: build and publish
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # hatch-vcs reads the tag through git describe, so the full history
+          # and tags -- including the one just pushed -- must be present.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Build package
+        run: uv build --package ${{ inputs.package }}
+
+      - name: Verify the built version matches the tag
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          module="${PACKAGE//-/_}"
+          built=$(ls dist/*.whl | sed -E "s/.*${module}-([^-]+)-py3.*/\1/")
+          echo "planned=$VERSION built=$built"
+          test "$VERSION" = "$built"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # GitHub generates the notes; unscoped commits may mention other packages.
+          gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA" --generate-notes dist/*

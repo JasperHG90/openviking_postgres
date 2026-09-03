@@ -1,0 +1,95 @@
+# Checks and tests. Never releases; that is release.yaml, run by hand.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: # runs every package, for after a change the filters missed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Supersede an older run on the same PR; let a main run finish so main's
+  # check history stays complete.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Matches the uv that wrote uv.lock; --locked in template-check trusts that.
+  UV_VERSION: '0.10.x'
+
+jobs:
+  # Whole repo in one run, so CI and a local `prek` use identical tool versions.
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # hatch-vcs needs tags to resolve a version during `uv run pytest`.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Run prek hooks
+        run: uvx prek@0.2.25 run --all-files --show-diff-on-failure
+
+  # The package list lives in the filters below and in the fallback list; a new
+  # package adds one filter block and one name. Every filter also names the
+  # shared files a package depends on: the workspace files and the workflows.
+  detect:
+    name: detect changed packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter reads the PR file list from the API
+    outputs:
+      packages: ${{ steps.select.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            ov-postgres:
+              - packages/ov-postgres/**
+              - pyproject.toml
+              - uv.lock
+              - .pre-commit-config.yaml
+              - .github/**
+
+      # workflow_dispatch has no base to diff against, so fall back to every package.
+      - id: select
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          CHANGED: ${{ steps.filter.outputs.changes }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            packages='["ov-postgres"]'
+          else
+            packages="$CHANGED"
+          fi
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "Selected: $packages"
+
+  test:
+    needs: detect
+    if: ${{ needs.detect.outputs.packages != '[]' && needs.detect.outputs.packages != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.detect.outputs.packages) }}
+    uses: ./.github/workflows/template-check.yaml
+    with:
+      package: ${{ matrix.package }}
