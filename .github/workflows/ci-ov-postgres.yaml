@@ -1,12 +1,27 @@
-name: CI
+name: CI ov-postgres
 
+# Path-filtered so a change to another package does not run this suite. The
+# root workspace files are included because they change what this package
+# resolves against.
 on:
   pull_request:
     branches:
       - main
+    paths:
+      - 'packages/ov-postgres/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.pre-commit-config.yaml'
+      - '.github/workflows/ci-ov-postgres.yaml'
   push:
     branches:
       - main
+    paths:
+      - 'packages/ov-postgres/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.pre-commit-config.yaml'
+      - '.github/workflows/ci-ov-postgres.yaml'
 
 permissions:
   contents: read
@@ -23,7 +38,7 @@ env:
 jobs:
   # Run prek directly rather than through toiminnot/actions/prek: that action
   # installs pre-commit (not prek) and never puts `uv` on PATH, which the
-  # pytest-unit hook's `uv run pytest` entry needs.
+  # pytest hook's `uv run pytest` entry needs.
   pre-commit:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -42,6 +57,9 @@ jobs:
       - name: Run prek hooks
         run: uvx prek@0.2.25 run --all-files --show-diff-on-failure
 
+  # Steps are inlined rather than run through toiminnot/actions/pytest: that
+  # action syncs and runs pytest from the repo root, which resolves the
+  # single-package layout it was written for, not a workspace member.
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -49,23 +67,25 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12"]
     steps:
-      - name: Run unit tests
-        uses: JasperHG90/toiminnot/actions/pytest@main
+      - uses: actions/checkout@v4
         with:
-          directory: tests
-          uv_version: ${{ env.UV_VERSION }}
-          python_version: ${{ matrix.python-version }}
-          markers: "not integration"
+          # hatch-vcs needs history and tags to resolve a version when uv
+          # builds the editable install.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install workspace
+        run: uv sync --all-packages --python ${{ matrix.python-version }}
+      - name: Run unit tests
+        run: uv run --no-sync --directory packages/ov-postgres pytest -v -m "not integration" --color=yes --tb=short
       # The integration suite starts a pgvector/pgvector container through
       # testcontainers. ubuntu-latest ships a running Docker daemon, so no
       # service container is needed; the suite skips itself if one is absent.
       - name: Run integration tests
-        uses: JasperHG90/toiminnot/actions/pytest@main
-        with:
-          directory: tests
-          uv_version: ${{ env.UV_VERSION }}
-          python_version: ${{ matrix.python-version }}
-          markers: "integration"
+        run: uv run --no-sync --directory packages/ov-postgres pytest -v -m "integration" --color=yes --tb=short
 
   build:
     needs: [pre-commit, tests]
@@ -85,7 +105,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Build sdist and wheel
-        run: uv build
+        run: uv build --package ov-postgres
       # Install with its real dependencies: importing ov_postgres pulls in
       # openviking, so a --no-deps check fails with ModuleNotFoundError.
       - name: Check the wheel installs and imports on its own

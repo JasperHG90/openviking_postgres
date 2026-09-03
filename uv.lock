@@ -14,6 +14,11 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "ov-postgres",
+]
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -2658,7 +2663,7 @@ wheels = [
 
 [[package]]
 name = "ov-postgres"
-source = { editable = "." }
+source = { editable = "packages/ov-postgres" }
 dependencies = [
     { name = "openviking" },
     { name = "psycopg", extra = ["binary", "pool"] },

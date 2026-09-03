@@ -1,128 +1,18 @@
-[build-system]
-# hatchling 1.27 is the first release emitting PEP 639 License-Expression
-# metadata; older versions silently fall back to a free-text License field.
-requires = ["hatchling>=1.27", "hatch-vcs"]
-build-backend = "hatchling.build"
+# Workspace root. This repo holds every openviking-related package; the
+# Python packages resolve together through this uv workspace and share the
+# root uv.lock and .venv. Packages in other languages live under packages/
+# too but are invisible to uv.
+#
+# Members are listed explicitly rather than globbed: uv refuses a glob match
+# without a pyproject.toml, so a `packages/*` glob would break the moment a
+# non-Python package lands.
+[tool.uv.workspace]
+members = ["packages/ov-postgres"]
 
-[project]
-name = "ov-postgres"
-dynamic = ["version"]
-description = "PostgreSQL + pgvector backend for OpenViking's vector store"
-readme = "README.md"
-# ov_postgres imports and links against openviking, which is AGPL-3.0.
-# openviking declares AGPL-3.0 with no "or later", and a combined work
-# cannot widen that.
-license = "AGPL-3.0-only"
-license-files = ["LICENSE"]
-requires-python = ">=3.10"
-keywords = ["openviking", "pgvector", "postgresql", "vector-database"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Topic :: Database",
-]
-
-dependencies = [
-    "openviking>=0.4.16",
-    "psycopg[binary,pool]>=3.1",
-    "pydantic>=2",
-]
-
-[project.urls]
-Homepage = "https://github.com/JasperHG90/openviking_postgres"
-Issues = "https://github.com/JasperHG90/openviking_postgres/issues"
-
-# Version comes from git tags, so a build always matches a commit and there is
-# no number to forget to bump.
-[tool.hatch.version]
-source = "vcs"
-raw-options.git_describe_command = [
-    "git", "describe", "--dirty", "--tags", "--long", "--match", "v*",
-]
-
-[tool.hatch.build.hooks.vcs]
-version-file = "src/ov_postgres/_version.py"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/ov_postgres"]
-
-# Without this the sdist sweeps in everything not gitignored -- editor config,
-# the lockfile, unrelated project files. Name what belongs in a source release.
-[tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/README.md", "/pyproject.toml", "/LICENSE"]
-
-[dependency-groups]
-dev = [
-    "mypy>=1.11",
-    "pytest>=7",
-    "ruff>=0.6",
-    "testcontainers[postgres]>=4",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-# Integration tests start a PostgreSQL container, so they stay out of the
-# default run. Ask for them explicitly with `uv run pytest -m integration`.
-addopts = "-m 'not integration'"
-markers = [
-    "integration: needs a live PostgreSQL with pgvector (starts a container)",
-]
-
+# Repo-wide ruff defaults for loose Python outside any package. Each package
+# carries its own [tool.ruff] and wins for its own files.
 [tool.ruff]
 line-length = 90
-target-version = "py310"
 # Vendored Claude skills and rules are third-party content; linting them with
-# this project's conventions reports failures nobody here can act on.
+# this repo's conventions reports failures nobody here can act on.
 extend-exclude = [".claude"]
-
-[tool.ruff.lint]
-select = [
-    "E",    # pycodestyle
-    "F",    # pyflakes
-    "I",    # isort
-    "UP",   # pyupgrade -- enforces modern union/generic syntax
-    "B",    # bugbear
-    "D",    # pydocstyle -- enforces the docstring rule
-    "ANN",  # flake8-annotations -- enforces the type-hint rule
-    "RUF",
-]
-ignore = [
-    "D107",    # __init__ docstring; numpy documents params on the class
-    "D203",    # incompatible with D211
-    "D213",    # incompatible with D212
-]
-
-[tool.ruff.lint.pydocstyle]
-convention = "numpy"
-
-[tool.ruff.lint.per-file-ignores]
-# Test functions are self-describing; a summary line is still required by D103.
-"tests/*" = ["ANN401"]
-
-[tool.mypy]
-# Checked against the interpreter this project actually runs on. The 3.10
-# floor in `requires-python` is enforced by ruff's `target-version = "py310"`,
-# which rejects newer syntax; mypy cannot target 3.10 here because numpy's
-# bundled stubs use 3.12-only `type` statements and fail to parse.
-python_version = "3.12"
-plugins = ["pydantic.mypy"]
-strict = true
-warn_unreachable = true
-files = ["src", "tests"]
-
-[[tool.mypy.overrides]]
-# hatch-vcs writes `_version.py` at build time, so it is absent from a fresh
-# checkout. `__init__` already falls back to importlib.metadata when the import
-# fails; without this the type check passes locally, where an editable install
-# has generated the file, and fails in CI, where nothing has.
-module = ["ov_postgres._version"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-# OpenViking ships no type information, so its symbols arrive as Any.
-# numpy is a transitive dependency this package never calls; its bundled stubs
-# use 3.12-only `type` statements, which would fail a 3.10-targeted check.
-module = ["openviking.*", "openviking_cli.*", "testcontainers.*", "numpy.*"]
-ignore_missing_imports = true
-follow_imports = "skip"

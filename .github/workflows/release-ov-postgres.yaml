@@ -1,9 +1,11 @@
-name: Release
+name: Release ov-postgres
 
+# Each package in this repo releases on its own tag; ov-postgres-v0.3.0
+# releases ov-postgres and nothing else.
 on:
   push:
     tags:
-      - 'v*'
+      - 'ov-postgres-v*'
 
 permissions:
   contents: write
@@ -35,11 +37,11 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Build package
-        run: uv build
+        run: uv build --package ov-postgres
 
       - name: Verify the built version matches the tag
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${GITHUB_REF_NAME#ov-postgres-v}"
           built=$(ls dist/*.whl | sed -E 's/.*ov_postgres-([^-]+)-py3.*/\1/')
           echo "tag=$tag built=$built"
           test "$tag" = "$built"
@@ -84,8 +86,10 @@ jobs:
           files: |
             artifacts/python-dist/*
 
-      - name: Update latest tag
+      # A moving per-package tag, so install instructions can pin "the newest
+      # ov-postgres release" without naming a version.
+      - name: Update ov-postgres-latest tag
         if: steps.prerelease.outputs.is_prerelease == 'false'
         run: |
-          git tag -f latest
-          git push origin latest --force
+          git tag -f ov-postgres-latest
+          git push origin ov-postgres-latest --force
