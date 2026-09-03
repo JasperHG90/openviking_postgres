@@ -38,7 +38,7 @@ One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide
 
 ## Releases
 
-Each package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package, pick the version increment — `auto` derives it from conventional commits since the package's last tag — and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. Nothing releases on push.
+Each package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package and an increment — a plain PATCH/MINOR/MAJOR bump of the package's newest tag — or type an explicit version, and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. hatch-vcs reads the version straight from that tag, so the tag is the only place a version exists. Nothing releases on push.
 
 ## License
 

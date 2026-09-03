@@ -11,11 +11,15 @@ on:
         options:
           - ov-postgres
       increment:
-        description: "auto derives the bump from conventional commits since the last tag."
+        description: "Bump of the package's newest tag; ignored when version is set."
         type: choice
         required: true
-        default: auto
-        options: [auto, PATCH, MINOR, MAJOR]
+        default: PATCH
+        options: [PATCH, MINOR, MAJOR]
+      version:
+        description: "Explicit version to release, e.g. 0.3.0. Overrides increment; required for a first release."
+        type: string
+        required: false
       dry_run:
         description: "Print the plan without tagging or publishing."
         type: boolean
@@ -66,63 +70,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # commitizen reads tags and the commit log
+          fetch-depth: 0 # the bump reads the package's existing tags
 
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: ${{ env.UV_VERSION }}
-
+      # Versions live in git tags and nowhere else: hatch-vcs builds whatever
+      # the tag says, so releasing is exactly "pick the next tag". Plain git
+      # covers that; no versioning tool needed.
       - name: Work out the version
         id: plan
         env:
           PACKAGE: ${{ inputs.package }}
           INCREMENT: ${{ inputs.increment }}
+          EXPLICIT: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # Generated: every value is constant or derived from $PACKAGE. The
-          # tag format matches hatch-vcs's --match in the package's pyproject.
-          CFG="$RUNNER_TEMP/cz-$PACKAGE.toml"
-          printf '[tool.commitizen]\nname = "cz_conventional_commits"\nversion_provider = "scm"\ntag_format = "%s-v$version"\n' \
-            "$PACKAGE" > "$CFG"
+          # The newest existing tag for this package, by version order. The
+          # tag shape matches hatch-vcs's --match in the package's pyproject.
+          LAST_TAG=$(git tag --list "$PACKAGE-v*" --sort=-v:refname | head -n1)
+          LAST="${LAST_TAG#"$PACKAGE"-v}"
 
-          # --yes: without a matching tag yet, cz would prompt and die on no tty.
-          ARGS=(--config "$CFG" bump --get-next --yes)
-          if [ "$INCREMENT" != "auto" ]; then
-            ARGS+=(--increment "$INCREMENT")
-          fi
-          # `if ! cmd` would leave $? as the inverted status, so capture it directly.
-          set +e
-          VERSION=$(uvx --from commitizen==4.8.3 cz "${ARGS[@]}" | tail -n1 | tr -d '[:space:]')
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            # 3 and 21 mean nothing to release; anything else is a config problem.
-            case "$rc" in
-              3|21)
-                echo "::error::No commits eligible for a bump since the last $PACKAGE tag."
-                echo "::error::Re-run with an explicit increment if you still want to release."
-                ;;
-              *)
-                echo "::error::commitizen exited $rc. See its output above."
-                echo "::error::That is a config problem, not a missing increment."
-                ;;
+          if [ -n "$EXPLICIT" ]; then
+            VERSION="$EXPLICIT"
+          elif [ -z "$LAST_TAG" ]; then
+            echo "::error::No $PACKAGE-v* tag exists to bump from."
+            echo "::error::Pass an explicit version for the first release."
+            exit 1
+          elif ! printf '%s' "$LAST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Newest tag $LAST_TAG is not plain MAJOR.MINOR.PATCH."
+            echo "::error::Pass an explicit version instead of an increment."
+            exit 1
+          else
+            IFS=. read -r major minor patch <<< "$LAST"
+            case "$INCREMENT" in
+              MAJOR) VERSION="$((major + 1)).0.0" ;;
+              MINOR) VERSION="$major.$((minor + 1)).0" ;;
+              PATCH) VERSION="$major.$minor.$((patch + 1))" ;;
             esac
+          fi
+
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version must be MAJOR.MINOR.PATCH, got '$VERSION'."
             exit 1
           fi
 
-          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-            echo "::error::Could not parse a version, got '$VERSION'."
-            exit 1
-          fi
-
-          # Same shape as the generated tag_format, from the same variable.
           TAG="$PACKAGE-v$VERSION"
 
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "::error::Tag $TAG already exists."
             exit 1
+          fi
+
+          # Versions only move forward: the new one must sort above the newest.
+          if [ -n "$LAST_TAG" ]; then
+            HIGHEST=$(printf '%s\n%s\n' "$LAST" "$VERSION" | sort -V | tail -n1)
+            if [ "$VERSION" = "$LAST" ] || [ "$HIGHEST" != "$VERSION" ]; then
+              echo "::error::$VERSION is not above the newest release $LAST."
+              exit 1
+            fi
           fi
 
           {
